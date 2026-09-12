@@ -51,14 +51,17 @@ class BackgroundMicService : Service() {
         private const val REPLY_TEXT = "Hi Mike, I'm listening."
         private const val REPLY_UTTERANCE_ID = "chatty_direct_reply"
 
-        // Android's speech service may apply its own initial-silence timeout, so v0.10
-        // gives the user two listening attempts. Once speech starts, these values make
-        // it much less eager to cut off a normal conversational question.
+        // Some Android / Google speech services ignore the requested silence values
+        // and end a recognition session after about a second of quiet. Instead of
+        // treating that as the end of the whole question, v0.11 stitches several
+        // recognition sessions together and only finishes after several empty ones.
         private const val ANDROID_SPEECH_ATTEMPT_TIMEOUT_MS = 25000L
-        private const val ANDROID_SPEECH_ATTEMPTS = 2
+        private const val INITIAL_NO_SPEECH_ATTEMPTS = 2
+        private const val CONTINUATION_NO_SPEECH_ATTEMPTS = 3
+        private const val MAX_ANDROID_SESSIONS = 12
         private const val SPEECH_MINIMUM_LENGTH_MS = 3000L
-        private const val SPEECH_COMPLETE_SILENCE_MS = 2500L
-        private const val SPEECH_POSSIBLY_COMPLETE_SILENCE_MS = 1800L
+        private const val SPEECH_COMPLETE_SILENCE_MS = 3000L
+        private const val SPEECH_POSSIBLY_COMPLETE_SILENCE_MS = 2200L
 
         private const val VOSK_FALLBACK_TIMEOUT_MS = 15000L
         private const val VOSK_FALLBACK_SILENCE_MS = 2500L
@@ -406,42 +409,72 @@ class BackgroundMicService : Service() {
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         prefs.edit()
             .putString("recognizer_status", "LISTENING for your question")
-            .putString("question_engine", "Android / Google speech recognition")
+            .putString("question_engine", "Android / Google speech recognition (continuous)")
             .putString("question_status", "Starting Android speech recognition…")
             .putString("question_partial", "")
             .apply()
         updateNotification("Listening for your question…")
 
         var lastAndroidResult = AndroidSpeechResult()
+        var combinedQuestion = ""
+        var initialNoSpeechCount = 0
+        var continuationNoSpeechCount = 0
+        var session = 0
 
-        for (attempt in 1..ANDROID_SPEECH_ATTEMPTS) {
-            if (!running || !wanted || myGeneration != generation) return
+        while (session < MAX_ANDROID_SESSIONS && running && wanted && myGeneration == generation) {
+            session++
 
-            if (attempt > 1) {
+            if (session > 1) {
+                val status = if (combinedQuestion.isBlank()) {
+                    "Still listening — go ahead…"
+                } else {
+                    "Still listening — continue when ready…"
+                }
                 prefs.edit()
-                    .putString("question_status", "Still listening — go ahead…")
-                    .putString("question_partial", "")
+                    .putString("question_status", status)
+                    .putString("question_partial", combinedQuestion)
                     .apply()
-                updateNotification("Still listening — go ahead…")
-                Thread.sleep(250)
+                updateNotification(status)
+                Thread.sleep(100)
             }
 
-            val androidResult = captureQuestionWithAndroidSpeech(myGeneration, attempt)
+            val androidResult = captureQuestionWithAndroidSpeech(myGeneration, session)
             lastAndroidResult = androidResult
 
-            if (androidResult.text.isNotBlank()) {
-                saveCapturedQuestion(androidResult.text, "Android / Google speech recognition")
-                return
-            }
-
             if (!running || !wanted || myGeneration != generation) return
-
             if (androidResult.useVoskFallback) break
+
+            val segment = androidResult.text.trim()
+            if (segment.isNotBlank()) {
+                combinedQuestion = mergeSpeechSegment(combinedQuestion, segment)
+                initialNoSpeechCount = 0
+                continuationNoSpeechCount = 0
+                prefs.edit()
+                    .putString("question_partial", combinedQuestion)
+                    .putString("question_status", "Hearing: “$combinedQuestion” — still listening")
+                    .apply()
+                updateNotification("Still listening for the rest of your question…")
+                continue
+            }
 
             val retryableNoSpeech = androidResult.errorCode == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
                 androidResult.errorCode == SpeechRecognizer.ERROR_NO_MATCH ||
                 androidResult.errorCode == -1
+
             if (!retryableNoSpeech) break
+
+            if (combinedQuestion.isBlank()) {
+                initialNoSpeechCount++
+                if (initialNoSpeechCount >= INITIAL_NO_SPEECH_ATTEMPTS) break
+            } else {
+                continuationNoSpeechCount++
+                if (continuationNoSpeechCount >= CONTINUATION_NO_SPEECH_ATTEMPTS) break
+            }
+        }
+
+        if (combinedQuestion.isNotBlank()) {
+            saveCapturedQuestion(combinedQuestion, "Android / Google speech recognition (continuous)")
+            return
         }
 
         if (!running || !wanted || myGeneration != generation) return
@@ -485,6 +518,17 @@ class BackgroundMicService : Service() {
             .putString("question_status", "No question heard — waiting for ‘Hey Chatty’")
             .putString("question_partial", "")
             .apply()
+    }
+
+    private fun mergeSpeechSegment(existing: String, newSegment: String): String {
+        val old = existing.trim().replace(Regex("\\s+"), " ")
+        val next = newSegment.trim().replace(Regex("\\s+"), " ")
+        if (old.isBlank()) return next
+        if (next.isBlank()) return old
+        if (next == old) return old
+        if (next.startsWith("$old ")) return next
+        if (old.endsWith(" $next")) return old
+        return "$old $next".replace(Regex("\\s+"), " ").trim()
     }
 
     private fun captureQuestionWithAndroidSpeech(
@@ -547,7 +591,7 @@ class BackgroundMicService : Service() {
 
                     override fun onEndOfSpeech() {
                         if (!finished.get()) {
-                            prefs.edit().putString("question_status", "Processing what you said…").apply()
+                            prefs.edit().putString("question_status", "Short pause detected — keeping the question open…").apply()
                         }
                     }
 
