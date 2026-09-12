@@ -29,38 +29,33 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var requestedText: TextView
     private lateinit var activeText: TextView
-    private lateinit var devicesContainer: LinearLayout
     private lateinit var levelText: TextView
-    private lateinit var backgroundText: TextView
+    private lateinit var wakeText: TextView
     private lateinit var meter: ProgressBar
+    private lateinit var devicesContainer: LinearLayout
 
-    @Volatile private var running = false
-    private var recorder: AudioRecord? = null
-    private var worker: Thread? = null
+    @Volatile private var foregroundRunning = false
+    private var foregroundRecorder: AudioRecord? = null
+    private var foregroundThread: Thread? = null
     private var selectedDeviceId: Int? = null
 
-    private val uiHandler = Handler(Looper.getMainLooper())
+    private val handler = Handler(Looper.getMainLooper())
     private val pollWakeStatus = object : Runnable {
         override fun run() {
-            if (::backgroundText.isInitialized) updateBackgroundResults()
-            uiHandler.postDelayed(this, 500)
+            if (::wakeText.isInitialized) updateWakeStatus()
+            handler.postDelayed(this, 500)
         }
     }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (granted) {
-            statusText.text = "Microphone permission granted"
-            refreshDevicesAndStartSelected()
-        } else {
-            statusText.text = "Microphone permission denied"
-        }
+        if (granted) startForegroundMic(null)
+        else statusText.text = "Microphone permission denied"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         val density = resources.displayMetrics.density
         val pad = (28 * density).toInt()
         val gap = (10 * density).toInt()
@@ -70,109 +65,89 @@ class MainActivity : AppCompatActivity() {
             setPadding(pad, pad, pad, pad)
         }
 
-        val title = TextView(this).apply {
+        root.addView(TextView(this).apply {
             text = "Chatty Mic Test v0.4"
             textSize = 28f
-        }
-        val instructions = TextView(this).apply {
-            text = "Wake-word test: start local listening, then say ‘Hey Chatty’. Recognition is performed on the Onn box; no speech is sent to the cloud."
+        })
+        root.addView(TextView(this).apply {
+            text = "Offline wake-word test: start local listening, then say ‘Hey Chatty’. No wake-word speech is sent to the cloud."
             textSize = 17f
             setPadding(0, gap, 0, gap)
-        }
+        })
+
         statusText = TextView(this).apply { textSize = 20f }
         requestedText = TextView(this).apply { textSize = 18f }
         activeText = TextView(this).apply { textSize = 18f }
-        levelText = TextView(this).apply {
-            text = "Live level: --"
-            textSize = 20f
-            setPadding(0, gap, 0, 0)
-        }
+        levelText = TextView(this).apply { textSize = 19f }
         meter = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
             progress = 0
         }
 
-        val refreshButton = Button(this).apply {
-            text = "Refresh audio devices"
-            isFocusable = true
-            setOnClickListener { refreshDevicesAndStartSelected() }
-        }
-
-        val backgroundHeading = TextView(this).apply {
-            text = "Local ‘Hey Chatty’ wake-word test"
-            textSize = 21f
-            setPadding(0, gap * 2, 0, gap)
-        }
-        backgroundText = TextView(this).apply {
-            text = "Not started yet."
-            textSize = 18f
-            setPadding(0, 0, 0, gap)
-        }
-        val startBackgroundButton = Button(this).apply {
-            text = "START LOCAL ‘HEY CHATTY’ TEST"
-            isFocusable = true
-            setOnClickListener { startBackgroundTest() }
-        }
-        val stopBackgroundButton = Button(this).apply {
-            text = "STOP LOCAL ‘HEY CHATTY’ TEST"
-            isFocusable = true
-            setOnClickListener { stopBackgroundTest() }
-        }
-
-        val devicesHeading = TextView(this).apply {
-            text = "Detected microphone inputs"
-            textSize = 21f
-            setPadding(0, gap * 2, 0, gap)
-        }
-        devicesContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-
-        root.addView(title)
-        root.addView(instructions)
         root.addView(statusText)
         root.addView(requestedText)
         root.addView(activeText)
         root.addView(levelText)
-        root.addView(
-            meter,
-            LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                (40 * density).toInt()
-            )
-        )
-        root.addView(refreshButton)
-        root.addView(backgroundHeading)
-        root.addView(backgroundText)
-        root.addView(startBackgroundButton)
-        root.addView(stopBackgroundButton)
-        root.addView(devicesHeading)
+        root.addView(meter, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            (40 * density).toInt()
+        ))
+
+        root.addView(Button(this).apply {
+            text = "REFRESH AUDIO DEVICES"
+            isFocusable = true
+            setOnClickListener {
+                stopWakeTest(silent = true)
+                renderDeviceButtons()
+                startSelectedForegroundMic()
+            }
+        })
+
+        root.addView(TextView(this).apply {
+            text = "Local ‘Hey Chatty’ wake-word test"
+            textSize = 21f
+            setPadding(0, gap * 2, 0, gap)
+        })
+
+        wakeText = TextView(this).apply {
+            text = "Not started yet."
+            textSize = 18f
+            setPadding(0, 0, 0, gap)
+        }
+        root.addView(wakeText)
+
+        root.addView(Button(this).apply {
+            text = "START LOCAL ‘HEY CHATTY’ TEST"
+            isFocusable = true
+            setOnClickListener { startWakeTest() }
+        })
+        root.addView(Button(this).apply {
+            text = "STOP LOCAL ‘HEY CHATTY’ TEST"
+            isFocusable = true
+            setOnClickListener { stopWakeTest() }
+        })
+
+        root.addView(TextView(this).apply {
+            text = "Detected microphone inputs"
+            textSize = 21f
+            setPadding(0, gap * 2, 0, gap)
+        })
+        devicesContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(devicesContainer)
 
-        val scrollView = ScrollView(this).apply {
-            addView(
-                root,
-                ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                )
-            )
-        }
-        setContentView(scrollView)
+        setContentView(ScrollView(this).apply {
+            addView(root, ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ))
+        })
 
         renderDeviceButtons()
-        updateBackgroundResults()
+        updateWakeStatus()
 
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.RECORD_AUDIO
-            ) == PackageManager.PERMISSION_GRANTED
-        ) {
-            if (!isBackgroundTestRunning()) {
-                refreshDevicesAndStartSelected()
-            } else {
-                statusText.text = "Local wake-word service is running"
-            }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            if (isWakeTestRunning()) statusText.text = "Local wake-word service is running"
+            else startSelectedForegroundMic()
         } else {
             statusText.text = "Requesting microphone permission…"
             permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
@@ -181,40 +156,36 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        uiHandler.removeCallbacks(pollWakeStatus)
-        uiHandler.post(pollWakeStatus)
+        handler.removeCallbacks(pollWakeStatus)
+        handler.post(pollWakeStatus)
     }
 
     override fun onPause() {
-        uiHandler.removeCallbacks(pollWakeStatus)
+        handler.removeCallbacks(pollWakeStatus)
         super.onPause()
     }
 
-    private fun getInputDevices(): Array<AudioDeviceInfo> {
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        return audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+    private fun inputDevices(): Array<AudioDeviceInfo> {
+        val manager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        return manager.getDevices(AudioManager.GET_DEVICES_INPUTS)
     }
 
     private fun renderDeviceButtons() {
         devicesContainer.removeAllViews()
 
-        val autoButton = Button(this).apply {
-            text = if (selectedDeviceId == null) {
-                "✓ AUTO — Let Android choose the microphone"
-            } else {
-                "AUTO — Let Android choose the microphone"
-            }
+        devicesContainer.addView(Button(this).apply {
+            text = if (selectedDeviceId == null) "✓ AUTO — LET ANDROID CHOOSE THE MICROPHONE"
+            else "AUTO — LET ANDROID CHOOSE THE MICROPHONE"
             isFocusable = true
             setOnClickListener {
-                stopBackgroundTest(silent = true)
+                stopWakeTest(silent = true)
                 selectedDeviceId = null
                 renderDeviceButtons()
-                startMicTest(null)
+                startForegroundMic(null)
             }
-        }
-        devicesContainer.addView(autoButton)
+        })
 
-        val inputs = getInputDevices()
+        val inputs = inputDevices()
         if (inputs.isEmpty()) {
             devicesContainer.addView(TextView(this).apply {
                 text = "Android currently reports no microphone input devices."
@@ -224,61 +195,30 @@ class MainActivity : AppCompatActivity() {
         }
 
         inputs.forEachIndexed { index, device ->
-            val selected = selectedDeviceId == device.id
-            val prefix = if (selected) "✓ " else ""
-            val button = Button(this).apply {
-                text = buildString {
-                    append(prefix)
-                    append("TEST INPUT ${index + 1}: ")
-                    append(deviceTypeName(device.type))
-                    append("\n")
-                    append(device.productName)
-                    append("   •   ID ")
-                    append(device.id)
-                }
+            devicesContainer.addView(Button(this).apply {
+                val mark = if (selectedDeviceId == device.id) "✓ " else ""
+                text = "$mark TEST INPUT ${index + 1}: ${deviceTypeName(device.type)}\n${device.productName}   •   ID ${device.id}"
                 isAllCaps = false
                 isFocusable = true
                 setOnClickListener {
-                    stopBackgroundTest(silent = true)
+                    stopWakeTest(silent = true)
                     selectedDeviceId = device.id
                     renderDeviceButtons()
-                    startMicTest(device)
+                    startForegroundMic(device)
                 }
-            }
-            devicesContainer.addView(button)
+            })
         }
     }
 
-    private fun refreshDevicesAndStartSelected() {
-        stopBackgroundTest(silent = true)
-        renderDeviceButtons()
-        val selected = selectedDeviceId?.let { id ->
-            getInputDevices().firstOrNull { it.id == id }
-        }
-
-        if (selectedDeviceId != null && selected == null) {
-            selectedDeviceId = null
-            renderDeviceButtons()
-            statusText.text = "Selected microphone disappeared; switched back to AUTO"
-        }
-
-        startMicTest(selected)
+    private fun startSelectedForegroundMic() {
+        val selected = selectedDeviceId?.let { id -> inputDevices().firstOrNull { it.id == id } }
+        if (selectedDeviceId != null && selected == null) selectedDeviceId = null
+        startForegroundMic(selected)
     }
 
-    private fun startMicTest(preferredDevice: AudioDeviceInfo?) {
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.RECORD_AUDIO
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            statusText.text = "Microphone permission is required"
-            return
-        }
-
-        stopMicTest()
-        meter.progress = 0
-        levelText.text = "Live level: --"
-        activeText.text = "Active/routed input: waiting for Android…"
+    private fun startForegroundMic(preferredDevice: AudioDeviceInfo?) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
+        stopForegroundMic()
 
         val sampleRate = 16000
         val minBuffer = AudioRecord.getMinBufferSize(
@@ -291,14 +231,13 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        val bufferSize = minBuffer * 2
         val audioRecord = try {
             AudioRecord(
                 MediaRecorder.AudioSource.VOICE_RECOGNITION,
                 sampleRate,
                 AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT,
-                bufferSize
+                minBuffer * 2
             )
         } catch (e: Exception) {
             statusText.text = "AudioRecord failed: ${e.message}"
@@ -306,60 +245,45 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (audioRecord.state != AudioRecord.STATE_INITIALIZED) {
-            statusText.text = "Microphone did not initialize"
             audioRecord.release()
+            statusText.text = "Microphone did not initialize"
             return
         }
 
-        val preferredAccepted = if (preferredDevice != null) {
-            audioRecord.setPreferredDevice(preferredDevice)
-        } else {
-            true
-        }
-
+        val accepted = preferredDevice?.let { audioRecord.setPreferredDevice(it) } ?: true
         requestedText.text = if (preferredDevice == null) {
             "Requested input: AUTO (Android chooses)"
         } else {
-            "Requested input: ${deviceTypeName(preferredDevice.type)} — ${preferredDevice.productName} — ID ${preferredDevice.id}\n" +
-                "Routing request accepted by Android: ${if (preferredAccepted) "YES" else "NO"}"
+            "Requested input: ${deviceTypeName(preferredDevice.type)} — ${preferredDevice.productName} — ID ${preferredDevice.id}\nRouting accepted: ${if (accepted) "YES" else "NO"}"
         }
 
-        recorder = audioRecord
-        running = true
+        foregroundRecorder = audioRecord
+        foregroundRunning = true
         statusText.text = "Foreground mic test listening…"
 
-        worker = Thread {
-            val buffer = ShortArray(bufferSize / 2)
+        foregroundThread = Thread {
+            val buffer = ShortArray(minBuffer)
             try {
                 audioRecord.startRecording()
-                while (running) {
+                while (foregroundRunning) {
                     val count = audioRecord.read(buffer, 0, buffer.size)
-                    if (count > 0) {
-                        var peak = 0
-                        for (i in 0 until count) {
-                            val value = abs(buffer[i].toInt())
-                            if (value > peak) peak = value
-                        }
-                        val percent = ((peak / 32767.0) * 100.0)
-                            .toInt()
-                            .coerceIn(0, 100)
-                        val routed = audioRecord.routedDevice
-
-                        runOnUiThread {
-                            meter.progress = percent
-                            levelText.text = "Live level: $percent%   •   Peak PCM: $peak"
-                            activeText.text = if (routed != null) {
-                                "Active/routed input: ${deviceTypeName(routed.type)} — ${routed.productName} — ID ${routed.id}"
-                            } else {
-                                "Active/routed input: Android has not reported the route yet"
-                            }
+                    if (count <= 0) continue
+                    var peak = 0
+                    for (i in 0 until count) peak = maxOf(peak, abs(buffer[i].toInt()))
+                    val percent = ((peak / 32767.0) * 100).toInt().coerceIn(0, 100)
+                    val routed = audioRecord.routedDevice
+                    runOnUiThread {
+                        meter.progress = percent
+                        levelText.text = "Live level: $percent%   •   Peak PCM: $peak"
+                        activeText.text = if (routed == null) {
+                            "Active/routed input: waiting for Android…"
+                        } else {
+                            "Active/routed input: ${deviceTypeName(routed.type)} — ${routed.productName} — ID ${routed.id}"
                         }
                     }
                 }
             } catch (e: Exception) {
-                if (running) {
-                    runOnUiThread { statusText.text = "Recording error: ${e.message}" }
-                }
+                if (foregroundRunning) runOnUiThread { statusText.text = "Recording error: ${e.message}" }
             }
         }.apply {
             name = "ChattyMicCapture"
@@ -367,84 +291,65 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun startBackgroundTest() {
-        if (ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.RECORD_AUDIO
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            statusText.text = "Microphone permission is required"
+    private fun startWakeTest() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
             return
         }
 
-        stopMicTest()
-        val prefs = getSharedPreferences(BackgroundMicService.PREFS, Context.MODE_PRIVATE)
-        prefs.edit().clear().apply()
-
+        stopForegroundMic()
+        getSharedPreferences(BackgroundMicService.PREFS, Context.MODE_PRIVATE).edit().clear().apply()
         val intent = Intent(this, BackgroundMicService::class.java).apply {
             action = BackgroundMicService.ACTION_START
             putExtra(BackgroundMicService.EXTRA_DEVICE_ID, selectedDeviceId ?: -1)
         }
         ContextCompat.startForegroundService(this, intent)
         statusText.text = "Starting local ‘Hey Chatty’ recognition…"
-        backgroundText.text = "Loading the offline speech model. Wait for LISTENING, then say ‘Hey Chatty’. You can press Home and test it from another app too."
+        wakeText.text = "Loading the offline model. Wait for LISTENING, then say ‘Hey Chatty’."
     }
 
-    private fun stopBackgroundTest(silent: Boolean = false) {
-        val intent = Intent(this, BackgroundMicService::class.java).apply {
-            action = BackgroundMicService.ACTION_STOP
-        }
+    private fun stopWakeTest(silent: Boolean = false) {
+        val intent = Intent(this, BackgroundMicService::class.java).apply { action = BackgroundMicService.ACTION_STOP }
         try { startService(intent) } catch (_: Exception) { stopService(Intent(this, BackgroundMicService::class.java)) }
-        if (!silent && ::backgroundText.isInitialized) {
-            updateBackgroundResults()
+        if (!silent && ::wakeText.isInitialized) {
             statusText.text = "Local wake-word test stopped"
+            updateWakeStatus()
         }
     }
 
-    private fun isBackgroundTestRunning(): Boolean {
-        return getSharedPreferences(BackgroundMicService.PREFS, Context.MODE_PRIVATE)
-            .getBoolean("running", false)
-    }
+    private fun isWakeTestRunning(): Boolean =
+        getSharedPreferences(BackgroundMicService.PREFS, Context.MODE_PRIVATE).getBoolean("running", false)
 
-    private fun updateBackgroundResults() {
-        val prefs = getSharedPreferences(BackgroundMicService.PREFS, Context.MODE_PRIVATE)
-        val runningNow = prefs.getBoolean("running", false)
-        val maxPeak = prefs.getInt("max_peak", 0)
-        val lastPeak = prefs.getInt("last_peak", 0)
-        val routedId = prefs.getInt("routed_id", -1)
-        val routedName = prefs.getString("routed_name", "Unknown") ?: "Unknown"
-        val requestedId = prefs.getInt("requested_id", -1)
-        val preferredAccepted = prefs.getBoolean("preferred_accepted", true)
-        val error = prefs.getString("error", "") ?: ""
-        val lastSampleTime = prefs.getLong("last_sample_time", 0L)
-        val recognizerStatus = prefs.getString("recognizer_status", "Not started") ?: "Not started"
-        val wakeCount = prefs.getInt("wake_count", 0)
-        val lastPartial = prefs.getString("last_partial", "") ?: ""
-        val lastResult = prefs.getString("last_result", "") ?: ""
-        val lastWakeText = prefs.getString("last_wake_text", "") ?: ""
-        val lastWakeTime = prefs.getLong("last_wake_time", 0L)
+    private fun updateWakeStatus() {
+        val p = getSharedPreferences(BackgroundMicService.PREFS, Context.MODE_PRIVATE)
+        val running = p.getBoolean("running", false)
+        val recognizerStatus = p.getString("recognizer_status", "Not started") ?: "Not started"
+        val requestedId = p.getInt("requested_id", -1)
+        val routedId = p.getInt("routed_id", -1)
+        val routedName = p.getString("routed_name", "Unknown") ?: "Unknown"
+        val wakeCount = p.getInt("wake_count", 0)
+        val lastWake = p.getString("last_wake_text", "") ?: ""
+        val wakeTime = p.getLong("last_wake_time", 0L)
+        val partial = p.getString("last_partial", "") ?: ""
+        val result = p.getString("last_result", "") ?: ""
+        val peak = p.getInt("last_peak", 0)
+        val maxPeak = p.getInt("max_peak", 0)
+        val error = p.getString("error", "") ?: ""
 
-        backgroundText.text = buildString {
-            append("Service: ${if (runningNow) "RUNNING" else "STOPPED"}\n")
+        wakeText.text = buildString {
+            append("Service: ${if (running) "RUNNING" else "STOPPED"}\n")
             append("Recognizer: $recognizerStatus\n")
-            append("Requested input: ${if (requestedId < 0) "AUTO" else "ID $requestedId"}")
-            if (requestedId >= 0) append("   •   Routing accepted: ${if (preferredAccepted) "YES" else "NO"}")
-            append("\n")
-            append("Actual routed input: $routedName")
+            append("Requested mic: ${if (requestedId < 0) "AUTO" else "ID $requestedId"}\n")
+            append("Actual routed mic: $routedName")
             if (routedId >= 0) append("   •   ID $routedId")
-            append("\n")
-            append("Wake phrase detections: $wakeCount")
-            if (lastWakeText.isNotBlank()) {
-                append("\nLAST WAKE: “$lastWakeText”")
-                if (lastWakeTime > 0) {
-                    append(" at ${DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(lastWakeTime))}")
-                }
+            append("\nWake phrase detections: $wakeCount")
+            if (lastWake.isNotBlank()) {
+                append("\nLAST WAKE: “$lastWake”")
+                if (wakeTime > 0) append(" at ${DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(wakeTime))}")
             }
-            if (lastPartial.isNotBlank()) append("\nCurrently hearing: “$lastPartial”")
-            if (lastResult.isNotBlank()) append("\nLast completed phrase: “$lastResult”")
-            append("\nMic peak: $lastPeak   •   Max: $maxPeak")
-            if (lastSampleTime > 0) append("\nAudio samples received: YES")
+            if (partial.isNotBlank()) append("\nCurrently hearing: “$partial”")
+            if (result.isNotBlank()) append("\nLast completed phrase: “$result”")
+            append("\nMic peak: $peak   •   Max: $maxPeak")
             if (error.isNotBlank()) append("\nERROR: $error")
         }
     }
@@ -456,28 +361,26 @@ class MainActivity : AppCompatActivity() {
         AudioDeviceInfo.TYPE_BLUETOOTH_SCO -> "Bluetooth SCO microphone"
         AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Wired headset microphone"
         AudioDeviceInfo.TYPE_BLE_HEADSET -> "Bluetooth LE headset"
-        AudioDeviceInfo.TYPE_TELEPHONY -> "Telephony input"
-        AudioDeviceInfo.TYPE_REMOTE_SUBMIX -> "Remote submix"
-        AudioDeviceInfo.TYPE_TV_TUNER -> "TV tuner input"
-        AudioDeviceInfo.TYPE_ECHO_REFERENCE -> "Echo reference"
+        25 -> "Remote submix"
+        17 -> "TV tuner input"
+        28 -> "Echo reference"
         else -> "Audio device type $type"
     }
 
-    private fun stopMicTest() {
-        running = false
-        val oldRecorder = recorder
-        val oldWorker = worker
-        recorder = null
-        worker = null
-
+    private fun stopForegroundMic() {
+        foregroundRunning = false
+        val oldRecorder = foregroundRecorder
+        val oldThread = foregroundThread
+        foregroundRecorder = null
+        foregroundThread = null
         try { oldRecorder?.stop() } catch (_: Exception) {}
-        try { oldWorker?.join(300) } catch (_: InterruptedException) {}
+        try { oldThread?.join(300) } catch (_: InterruptedException) {}
         try { oldRecorder?.release() } catch (_: Exception) {}
     }
 
     override fun onDestroy() {
-        uiHandler.removeCallbacks(pollWakeStatus)
-        stopMicTest()
+        handler.removeCallbacks(pollWakeStatus)
+        stopForegroundMic()
         super.onDestroy()
     }
 }
