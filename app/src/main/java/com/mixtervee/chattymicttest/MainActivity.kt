@@ -51,12 +51,12 @@ class MainActivity : AppCompatActivity() {
         }
 
         root.addView(TextView(this).apply {
-            text = "Chatty Mic Test v0.9"
+            text = "Chatty Mic Test v0.10"
             textSize = 30f
         })
 
         root.addView(TextView(this).apply {
-            text = "Say “Hey Chatty”. After Chatty replies, ask your question normally."
+            text = "Say “Hey Chatty”. After Chatty replies, ask your question normally — no need to rush."
             textSize = 19f
             setPadding(0, gap, 0, gap * 2)
         })
