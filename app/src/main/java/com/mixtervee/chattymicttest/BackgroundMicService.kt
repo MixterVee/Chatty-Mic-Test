@@ -9,13 +9,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
-import android.media.MediaPlayer
 import android.media.MediaRecorder
-import android.os.Bundle
 import android.os.IBinder
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
@@ -25,8 +22,9 @@ import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
 import org.vosk.android.StorageService
-import java.io.File
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 
 class BackgroundMicService : Service() {
@@ -41,27 +39,26 @@ class BackgroundMicService : Service() {
         private const val SAMPLE_RATE = 16000
         private const val WAKE_PHRASE = "hey chatty"
         private const val REPLY_TEXT = "Hi Mike, I'm listening."
-        private const val REPLY_UTTERANCE_ID = "chatty_reply_file"
+        private const val REPLY_UTTERANCE_ID = "chatty_direct_reply"
     }
 
     @Volatile private var running = false
     @Volatile private var wanted = false
-    @Volatile private var replyReady = false
+    @Volatile private var ttsReady = false
+    @Volatile private var replyLatch: CountDownLatch? = null
+
     private var recorder: AudioRecord? = null
     private var recognizer: Recognizer? = null
     private var model: Model? = null
     private var worker: Thread? = null
     private var generation = 0
     private var textToSpeech: TextToSpeech? = null
-    private var replyPlayer: MediaPlayer? = null
-    private lateinit var replyFile: File
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
-        replyFile = File(cacheDir, "chatty_reply.wav")
         initTextToSpeech()
     }
 
@@ -89,6 +86,7 @@ class BackgroundMicService : Service() {
         textToSpeech = TextToSpeech(this) { status ->
             val tts = textToSpeech
             if (status != TextToSpeech.SUCCESS || tts == null) {
+                ttsReady = false
                 prefs.edit().putString("reply_status", "Android speech engine failed to initialize").apply()
                 return@TextToSpeech
             }
@@ -97,44 +95,45 @@ class BackgroundMicService : Service() {
             if (languageResult == TextToSpeech.LANG_MISSING_DATA || languageResult == TextToSpeech.LANG_NOT_SUPPORTED) {
                 languageResult = tts.setLanguage(Locale.US)
             }
-            if (languageResult == TextToSpeech.LANG_MISSING_DATA || languageResult == TextToSpeech.LANG_NOT_SUPPORTED) {
+            ttsReady = languageResult != TextToSpeech.LANG_MISSING_DATA &&
+                languageResult != TextToSpeech.LANG_NOT_SUPPORTED
+
+            if (!ttsReady) {
                 prefs.edit().putString("reply_status", "English speech voice is unavailable").apply()
                 return@TextToSpeech
             }
 
             tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) = Unit
+                override fun onStart(utteranceId: String?) {
+                    if (utteranceId == REPLY_UTTERANCE_ID) {
+                        prefs.edit().putString("reply_status", "Wake TTS callback: STARTED").apply()
+                    }
+                }
 
                 override fun onDone(utteranceId: String?) {
                     if (utteranceId == REPLY_UTTERANCE_ID) {
-                        replyReady = replyFile.exists() && replyFile.length() > 0
-                        prefs.edit().putString(
-                            "reply_status",
-                            if (replyReady) "Spoken reply ready" else "Spoken reply file was not created"
-                        ).apply()
+                        prefs.edit().putString("reply_status", "Wake TTS callback: DONE").apply()
+                        replyLatch?.countDown()
                     }
                 }
 
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
                     if (utteranceId == REPLY_UTTERANCE_ID) {
-                        prefs.edit().putString("reply_status", "Could not create spoken reply").apply()
+                        prefs.edit().putString("reply_status", "Wake TTS callback: ERROR").apply()
+                        replyLatch?.countDown()
                     }
                 }
 
                 override fun onError(utteranceId: String?, errorCode: Int) {
                     if (utteranceId == REPLY_UTTERANCE_ID) {
-                        prefs.edit().putString("reply_status", "Could not create spoken reply (error $errorCode)").apply()
+                        prefs.edit().putString("reply_status", "Wake TTS callback: ERROR $errorCode").apply()
+                        replyLatch?.countDown()
                     }
                 }
             })
 
-            try { replyFile.delete() } catch (_: Exception) {}
-            val result = tts.synthesizeToFile(REPLY_TEXT, Bundle(), replyFile, REPLY_UTTERANCE_ID)
-            prefs.edit().putString(
-                "reply_status",
-                if (result == TextToSpeech.SUCCESS) "Preparing spoken reply…" else "Speech synthesis request failed"
-            ).apply()
+            prefs.edit().putString("reply_status", "Android TTS READY for wake reply").apply()
         }
     }
 
@@ -157,9 +156,9 @@ class BackgroundMicService : Service() {
             .putString("last_result", "")
             .putString("last_wake_text", "")
             .putLong("last_wake_time", 0L)
-            .putString("reply_route", "Not used yet")
+            .putString("reply_route", "DEFAULT Android TTS route (same path as manual voice test)")
             .putBoolean("reply_route_accepted", true)
-            .putString("reply_routed_name", "Unknown")
+            .putString("reply_routed_name", "Android default / TV")
             .putInt("reply_routed_id", -1)
             .putString("recognizer_status", "Loading offline model…")
             .putString("error", "")
@@ -255,6 +254,8 @@ class BackgroundMicService : Service() {
         prefs.edit()
             .putBoolean("preferred_accepted", preferredAccepted)
             .putString("recognizer_status", "LISTENING locally for ‘Hey Chatty’")
+            .putString("reply_route", "DEFAULT Android TTS route (same path as manual voice test)")
+            .putBoolean("reply_route_accepted", true)
             .apply()
 
         recorder = audioRecord
@@ -303,7 +304,20 @@ class BackgroundMicService : Service() {
                             .putLong("last_wake_time", now)
                             .apply()
                         updateNotification("HEY CHATTY detected! • Count: $wakeCount")
-                        playReply(requestedOutputId)
+
+                        // The manual voice test works because the microphone is not holding the
+                        // audio path while Android TTS speaks. Do the same here: temporarily stop
+                        // capture, use TextToSpeech.speak() directly, then resume listening.
+                        try { audioRecord.stop() } catch (_: Exception) {}
+                        Thread.sleep(150)
+                        playDirectTtsReply()
+                        Thread.sleep(200)
+                        if (running && wanted && myGeneration == generation) {
+                            try { audioRecord.startRecording() } catch (e: Exception) {
+                                prefs.edit().putString("error", "Could not resume microphone after TTS: ${e.message}").apply()
+                            }
+                        }
+
                         try { voskRecognizer.reset() } catch (_: Exception) {}
                     }
 
@@ -336,77 +350,56 @@ class BackgroundMicService : Service() {
         }
     }
 
-    private fun playReply(requestedOutputId: Int) {
+    private fun playDirectTtsReply() {
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val tts = textToSpeech
         val currentReplyCount = prefs.getInt("reply_count", 0)
 
-        if (!replyReady || !replyFile.exists()) {
-            val tts = textToSpeech
-            if (tts != null) {
-                val result = tts.speak(REPLY_TEXT, TextToSpeech.QUEUE_FLUSH, null, "chatty_direct_reply")
-                prefs.edit()
-                    .putInt("reply_count", currentReplyCount + if (result == TextToSpeech.SUCCESS) 1 else 0)
-                    .putString("reply_route", "DEFAULT Android audio route (TTS fallback)")
-                    .putString("reply_status", if (result == TextToSpeech.SUCCESS) "Spoken reply played using default route" else "Spoken reply failed")
-                    .apply()
-            } else {
-                prefs.edit().putString("reply_status", "Speech engine not ready when wake phrase was detected").apply()
-            }
+        if (!ttsReady || tts == null) {
+            prefs.edit()
+                .putString("reply_status", "Wake TTS requested: NO — speech engine not ready")
+                .apply()
             return
         }
 
-        try {
-            try { replyPlayer?.release() } catch (_: Exception) {}
-            replyPlayer = null
+        val latch = CountDownLatch(1)
+        replyLatch = latch
+        prefs.edit()
+            .putString("reply_status", "Wake TTS requested: YES — waiting for STARTED callback")
+            .putString("reply_route", "DEFAULT Android TTS route (same path as manual voice test)")
+            .putBoolean("reply_route_accepted", true)
+            .putString("reply_routed_name", "Android default / TV")
+            .putInt("reply_routed_id", -1)
+            .apply()
 
-            val player = MediaPlayer()
-            player.setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
-            player.setDataSource(replyFile.absolutePath)
-            player.prepare()
-
-            val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            val requestedOutput = if (requestedOutputId >= 0) {
-                audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).firstOrNull { it.id == requestedOutputId }
-            } else null
-            val routeAccepted = requestedOutput?.let { player.setPreferredDevice(it) } ?: true
-
-            prefs.edit()
-                .putInt("reply_count", currentReplyCount + 1)
-                .putString(
-                    "reply_route",
-                    if (requestedOutput == null) "AUTO / Android default output" else "${requestedOutput.productName} • ID ${requestedOutput.id}"
-                )
-                .putBoolean("reply_route_accepted", routeAccepted)
-                .putString("reply_status", "Playing: “$REPLY_TEXT”")
-                .apply()
-
-            player.setOnCompletionListener { completed ->
-                val routed = completed.routedDevice
-                prefs.edit()
-                    .putString("reply_status", "Last spoken reply completed")
-                    .putString("reply_routed_name", routed?.productName?.toString() ?: "Unknown")
-                    .putInt("reply_routed_id", routed?.id ?: -1)
-                    .apply()
-                try { completed.release() } catch (_: Exception) {}
-                if (replyPlayer === completed) replyPlayer = null
-            }
-            player.setOnErrorListener { failed, what, extra ->
-                prefs.edit().putString("reply_status", "Reply playback error $what/$extra").apply()
-                try { failed.release() } catch (_: Exception) {}
-                if (replyPlayer === failed) replyPlayer = null
-                true
-            }
-
-            replyPlayer = player
-            player.start()
+        val result = try {
+            tts.speak(REPLY_TEXT, TextToSpeech.QUEUE_FLUSH, null, REPLY_UTTERANCE_ID)
         } catch (e: Exception) {
-            prefs.edit().putString("reply_status", "Reply playback failed: ${e.message}").apply()
+            prefs.edit().putString("reply_status", "Wake TTS speak() exception: ${e.message}").apply()
+            replyLatch = null
+            return
         }
+
+        if (result != TextToSpeech.SUCCESS) {
+            prefs.edit().putString("reply_status", "Wake TTS speak() request FAILED ($result)").apply()
+            replyLatch = null
+            return
+        }
+
+        prefs.edit()
+            .putInt("reply_count", currentReplyCount + 1)
+            .putString("reply_status", "Wake TTS speak() request ACCEPTED")
+            .apply()
+
+        val callbackArrived = try {
+            latch.await(6, TimeUnit.SECONDS)
+        } catch (_: InterruptedException) {
+            false
+        }
+        if (!callbackArrived) {
+            prefs.edit().putString("reply_status", "Wake TTS callback: TIMEOUT after 6 seconds").apply()
+        }
+        replyLatch = null
     }
 
     private fun extractText(json: String, key: String): String {
@@ -469,6 +462,8 @@ class BackgroundMicService : Service() {
 
     private fun stopCapture(closeModel: Boolean = true) {
         running = false
+        replyLatch?.countDown()
+        replyLatch = null
         val oldRecorder = recorder
         val oldRecognizer = recognizer
         val oldWorker = worker
@@ -491,11 +486,10 @@ class BackgroundMicService : Service() {
         wanted = false
         generation++
         stopCapture(closeModel = true)
-        try { replyPlayer?.release() } catch (_: Exception) {}
-        replyPlayer = null
         try { textToSpeech?.stop() } catch (_: Exception) {}
         try { textToSpeech?.shutdown() } catch (_: Exception) {}
         textToSpeech = null
+        ttsReady = false
         super.onDestroy()
     }
 }
