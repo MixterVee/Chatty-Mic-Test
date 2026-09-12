@@ -1,47 +1,45 @@
 # Chatty Mic Test
 
-Tiny Android TV / Google TV microphone test app for checking which microphone inputs a third-party app can see and actually use on devices such as the original Onn 4K Pro and Nvidia Shield.
+Android TV / Google TV test app for proving that a third-party app can use the original Onn 4K Pro's built-in far-field microphones and keep listening in the background.
 
-## v0.2
+## v0.4
 
-- Requests microphone permission
-- Starts live microphone capture using `VOICE_RECOGNITION`
-- Shows a live level meter and PCM peak
-- Lists every Android-reported microphone input device
-- Provides a button to test each detected input individually
-- Includes an AUTO mode that lets Android choose the input
-- Shows both the requested microphone and the actual routed microphone
-- Reports whether Android accepted a preferred-device routing request
-- Includes a Refresh button for plugging/unplugging USB audio devices such as an EMEET speakerphone
-- Built for sideloading on Android TV / Google TV
+- Keeps the foreground microphone/device tests from earlier versions
+- Runs a foreground microphone service that keeps working after pressing Home
+- Uses Vosk entirely on-device for offline speech recognition
+- Listens specifically for **Hey Chatty**
+- Shows live/last recognized text, wake count, routed microphone, PCM peaks, and errors
+- Does not send wake-word audio to any cloud service
+- Bundles the small US English Vosk model in the GitHub Actions APK
 
 ## Build
 
 GitHub Actions builds the debug APK automatically on pushes to `main`.
 
-Go to **Actions → Build Chatty Mic Test APK → latest successful run → Artifacts** and download **Chatty-Mic-Test-v0.2**.
+Go to **Actions → Build Chatty Mic Test APK → latest successful run → Artifacts** and download **Chatty-Mic-Test-v0.4**.
 
 The APK inside the ZIP is `app-debug.apk`.
 
-## Onn 4K Pro built-in microphone test
+## v0.4 wake-word test
 
-1. Sideload `app-debug.apk` onto the original Onn 4K Pro.
-2. Make sure the physical microphone switch on the Onn is enabled.
-3. Launch **Chatty Mic Test** and allow microphone access.
-4. Start with **AUTO — Let Android choose the microphone**.
-5. Talk toward the Onn box from several feet away and watch the live level meter.
-6. Note the **Active/routed input** shown near the top.
-7. If more than one input is listed, select each **TEST INPUT** button and repeat the test.
+1. Install v0.4 over the previous Chatty Mic Test build.
+2. Make sure the physical microphone switch on the Onn 4K Pro is ON.
+3. Launch Chatty Mic Test and leave the microphone selection on **AUTO** initially.
+4. Select **START LOCAL ‘HEY CHATTY’ TEST**.
+5. Wait until the status shows that the offline model is ready and the recognizer is **LISTENING locally for ‘Hey Chatty’**.
+6. Say **Hey Chatty** several times from different distances.
+7. Watch **Wake phrase detections**, **Currently hearing**, and **LAST WAKE**.
+8. Press Home, open another app if desired, say **Hey Chatty**, then return to Chatty and check whether the wake count increased.
 
-## EMEET USB speakerphone test
+The wake-word test is deliberately local-only. ChatGPT/API integration comes later, after wake-word reliability is proven.
 
-1. Connect the EMEET speakerphone to the Onn 4K Pro or Nvidia Shield by USB.
-2. Launch Chatty Mic Test, or press **Refresh audio devices** if it is already open.
-3. Look for a **USB audio device** or **USB headset / speakerphone** entry.
-4. Select that input and talk toward the EMEET.
-5. Check whether **Routing request accepted by Android** says **YES**.
-6. More importantly, check whether **Active/routed input** matches the EMEET/USB device and whether the live meter responds.
+## Previously proven on the original Onn 4K Pro
 
-Android may accept a preferred-device request but still route capture elsewhere, so the **Active/routed input** is the most important result.
+- Android exposes two built-in microphone inputs.
+- Both inputs receive room audio.
+- Flipping the Onn's physical microphone switch OFF drops captured PCM to zero, confirming the signal is from the box microphones rather than the handheld remote.
+- Background microphone capture continues after pressing Home.
 
-If foreground capture works, the next experiment is a foreground microphone service to see whether Chatty can continue listening after pressing Home and while another TV app is in use.
+## EMEET / Nvidia Shield fallback
+
+Chatty still lists all Android audio inputs, so a USB EMEET speakerphone can also be tested on the Onn or Nvidia Shield by selecting the corresponding USB audio input.
