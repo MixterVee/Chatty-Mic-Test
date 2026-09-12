@@ -45,13 +45,23 @@ class BackgroundMicService : Service() {
         const val PREFS = "background_mic_test"
         const val CHANNEL_ID = "chatty_background_mic"
         const val NOTIFICATION_ID = 1001
+
         private const val SAMPLE_RATE = 16000
         private const val WAKE_PHRASE = "hey chatty"
         private const val REPLY_TEXT = "Hi Mike, I'm listening."
         private const val REPLY_UTTERANCE_ID = "chatty_direct_reply"
-        private const val ANDROID_SPEECH_TIMEOUT_MS = 16000L
-        private const val VOSK_FALLBACK_TIMEOUT_MS = 12000L
-        private const val VOSK_FALLBACK_SILENCE_MS = 1900L
+
+        // Android's speech service may apply its own initial-silence timeout, so v0.10
+        // gives the user two listening attempts. Once speech starts, these values make
+        // it much less eager to cut off a normal conversational question.
+        private const val ANDROID_SPEECH_ATTEMPT_TIMEOUT_MS = 25000L
+        private const val ANDROID_SPEECH_ATTEMPTS = 2
+        private const val SPEECH_MINIMUM_LENGTH_MS = 3000L
+        private const val SPEECH_COMPLETE_SILENCE_MS = 2500L
+        private const val SPEECH_POSSIBLY_COMPLETE_SILENCE_MS = 1800L
+
+        private const val VOSK_FALLBACK_TIMEOUT_MS = 15000L
+        private const val VOSK_FALLBACK_SILENCE_MS = 2500L
     }
 
     private data class AndroidSpeechResult(
@@ -191,7 +201,10 @@ class BackgroundMicService : Service() {
             .apply()
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            prefs.edit().putBoolean("running", false).putString("error", "RECORD_AUDIO permission missing").apply()
+            prefs.edit()
+                .putBoolean("running", false)
+                .putString("error", "RECORD_AUDIO permission missing")
+                .apply()
             stopSelf()
             return
         }
@@ -223,11 +236,7 @@ class BackgroundMicService : Service() {
         )
     }
 
-    private fun beginCapture(
-        requestedId: Int,
-        loadedModel: Model,
-        myGeneration: Int
-    ) {
+    private fun beginCapture(requestedId: Int, loadedModel: Model, myGeneration: Int) {
         if (!wanted || myGeneration != generation) return
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
@@ -331,12 +340,10 @@ class BackgroundMicService : Service() {
                             .apply()
                         updateNotification("Hey Chatty detected")
 
-                        // Release the active microphone capture before TTS and Android's
-                        // SpeechRecognizer take turns using the same microphone.
                         try { audioRecord.stop() } catch (_: Exception) {}
                         Thread.sleep(150)
                         playDirectTtsReply()
-                        Thread.sleep(250)
+                        Thread.sleep(200)
 
                         if (running && wanted && myGeneration == generation) {
                             try {
@@ -354,7 +361,9 @@ class BackgroundMicService : Service() {
                                     updateNotification("Listening for “Hey Chatty”")
                                 }
                             } catch (e: Exception) {
-                                prefs.edit().putString("error", "Could not resume microphone after question: ${e.message}").apply()
+                                prefs.edit()
+                                    .putString("error", "Could not resume microphone after question: ${e.message}")
+                                    .apply()
                             }
                         }
                     }
@@ -395,7 +404,6 @@ class BackgroundMicService : Service() {
         myGeneration: Int
     ) {
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-
         prefs.edit()
             .putString("recognizer_status", "LISTENING for your question")
             .putString("question_engine", "Android / Google speech recognition")
@@ -404,20 +412,46 @@ class BackgroundMicService : Service() {
             .apply()
         updateNotification("Listening for your question…")
 
-        val androidResult = captureQuestionWithAndroidSpeech(myGeneration)
-        if (androidResult.text.isNotBlank()) {
-            saveCapturedQuestion(androidResult.text, "Android / Google speech recognition")
-            return
+        var lastAndroidResult = AndroidSpeechResult()
+
+        for (attempt in 1..ANDROID_SPEECH_ATTEMPTS) {
+            if (!running || !wanted || myGeneration != generation) return
+
+            if (attempt > 1) {
+                prefs.edit()
+                    .putString("question_status", "Still listening — go ahead…")
+                    .putString("question_partial", "")
+                    .apply()
+                updateNotification("Still listening — go ahead…")
+                Thread.sleep(250)
+            }
+
+            val androidResult = captureQuestionWithAndroidSpeech(myGeneration, attempt)
+            lastAndroidResult = androidResult
+
+            if (androidResult.text.isNotBlank()) {
+                saveCapturedQuestion(androidResult.text, "Android / Google speech recognition")
+                return
+            }
+
+            if (!running || !wanted || myGeneration != generation) return
+
+            if (androidResult.useVoskFallback) break
+
+            val retryableNoSpeech = androidResult.errorCode == SpeechRecognizer.ERROR_SPEECH_TIMEOUT ||
+                androidResult.errorCode == SpeechRecognizer.ERROR_NO_MATCH ||
+                androidResult.errorCode == -1
+            if (!retryableNoSpeech) break
         }
 
         if (!running || !wanted || myGeneration != generation) return
 
-        if (androidResult.useVoskFallback) {
+        if (lastAndroidResult.useVoskFallback) {
             prefs.edit()
                 .putString("question_engine", "Vosk offline fallback")
                 .putString(
                     "question_status",
-                    "Android speech unavailable (${androidResult.errorText}); using offline fallback…"
+                    "Android speech unavailable (${lastAndroidResult.errorText}); using offline fallback…"
                 )
                 .putString("question_partial", "")
                 .apply()
@@ -448,19 +482,15 @@ class BackgroundMicService : Service() {
         }
 
         prefs.edit()
-            .putString(
-                "question_status",
-                if (androidResult.errorText.isBlank()) {
-                    "No question heard — waiting for ‘Hey Chatty’"
-                } else {
-                    "Android speech: ${androidResult.errorText}"
-                }
-            )
+            .putString("question_status", "No question heard — waiting for ‘Hey Chatty’")
             .putString("question_partial", "")
             .apply()
     }
 
-    private fun captureQuestionWithAndroidSpeech(myGeneration: Int): AndroidSpeechResult {
+    private fun captureQuestionWithAndroidSpeech(
+        myGeneration: Int,
+        attempt: Int
+    ): AndroidSpeechResult {
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val latch = CountDownLatch(1)
         questionLatch = latch
@@ -499,7 +529,10 @@ class BackgroundMicService : Service() {
                 speech.setRecognitionListener(object : RecognitionListener {
                     override fun onReadyForSpeech(params: Bundle?) {
                         if (!finished.get()) {
-                            prefs.edit().putString("question_status", "LISTENING — ask your question now").apply()
+                            val suffix = if (attempt > 1) " — take your time" else ""
+                            prefs.edit()
+                                .putString("question_status", "LISTENING — ask your question now$suffix")
+                                .apply()
                         }
                     }
 
@@ -525,7 +558,9 @@ class BackgroundMicService : Service() {
                         errorText.set(description)
 
                         val partial = lastPartial.get().trim()
-                        if (partial.isNotBlank() && (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)) {
+                        if (partial.isNotBlank() &&
+                            (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)
+                        ) {
                             resultText.set(partial)
                         } else {
                             shouldFallback.set(
@@ -547,7 +582,10 @@ class BackgroundMicService : Service() {
                         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         val best = matches?.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
                         resultText.set(best)
-                        if (best.isBlank()) errorText.set("no match")
+                        if (best.isBlank()) {
+                            errorCode.set(SpeechRecognizer.ERROR_NO_MATCH)
+                            errorText.set("no match")
+                        }
                         finishOnce()
                     }
 
@@ -573,9 +611,15 @@ class BackgroundMicService : Service() {
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
                     putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
                     putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
-                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 500L)
-                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1300L)
-                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 900L)
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, SPEECH_MINIMUM_LENGTH_MS)
+                    putExtra(
+                        RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
+                        SPEECH_COMPLETE_SILENCE_MS
+                    )
+                    putExtra(
+                        RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
+                        SPEECH_POSSIBLY_COMPLETE_SILENCE_MS
+                    )
                 }
                 speech.startListening(intent)
             } catch (e: Exception) {
@@ -587,7 +631,7 @@ class BackgroundMicService : Service() {
         }
 
         val completed = try {
-            latch.await(ANDROID_SPEECH_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            latch.await(ANDROID_SPEECH_ATTEMPT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
         } catch (_: InterruptedException) {
             false
         }
@@ -595,7 +639,6 @@ class BackgroundMicService : Service() {
         if (!completed) {
             errorCode.set(-1)
             errorText.set("timed out")
-            shouldFallback.set(true)
             finished.set(true)
             prefs.edit().putString("question_status", "Android speech timed out").apply()
         }
@@ -652,9 +695,7 @@ class BackgroundMicService : Service() {
                         completedSegments.add(text)
                         heardAnything = true
                         lastChangedAt = now
-                        val combined = (completedSegments + lastPartial.takeIf { it.isNotBlank() }.orEmpty())
-                            .filter { it.isNotBlank() }
-                            .joinToString(" ")
+                        val combined = completedSegments.joinToString(" ").trim()
                         prefs.edit()
                             .putString("question_partial", combined)
                             .putString("question_status", "Hearing: “$combined”")
@@ -852,7 +893,10 @@ class BackgroundMicService : Service() {
             try { model?.close() } catch (_: Exception) {}
             model = null
         }
-        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("running", false).apply()
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean("running", false)
+            .apply()
     }
 
     override fun onDestroy() {
