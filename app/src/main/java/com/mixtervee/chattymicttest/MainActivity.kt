@@ -11,9 +11,12 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
@@ -25,6 +28,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import java.text.DateFormat
 import java.util.Date
+import java.util.Locale
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.sin
@@ -33,6 +37,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val UI_PREFS = "chatty_ui"
         private const val UI_OUTPUT_ID = "selected_output_id"
+        private const val TTS_TEST_ID = "chatty_tts_test"
     }
 
     private lateinit var statusText: TextView
@@ -41,6 +46,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var levelText: TextView
     private lateinit var wakeText: TextView
     private lateinit var outputStatusText: TextView
+    private lateinit var ttsStatusText: TextView
     private lateinit var meter: ProgressBar
     private lateinit var devicesContainer: LinearLayout
     private lateinit var outputsContainer: LinearLayout
@@ -50,6 +56,9 @@ class MainActivity : AppCompatActivity() {
     private var foregroundThread: Thread? = null
     private var selectedDeviceId: Int? = null
     private var selectedOutputDeviceId: Int? = null
+
+    private var tts: TextToSpeech? = null
+    @Volatile private var ttsReady = false
 
     private val handler = Handler(Looper.getMainLooper())
     private val pollWakeStatus = object : Runnable {
@@ -62,12 +71,13 @@ class MainActivity : AppCompatActivity() {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (granted) startForegroundMic(null)
+        if (granted) startSelectedForegroundMic()
         else statusText.text = "Microphone permission denied"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
         selectedOutputDeviceId = getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE)
             .getInt(UI_OUTPUT_ID, -1)
             .takeIf { it >= 0 }
@@ -82,11 +92,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         root.addView(TextView(this).apply {
-            text = "Chatty Mic Test v0.5"
+            text = "Chatty Mic Test v0.6"
             textSize = 28f
         })
         root.addView(TextView(this).apply {
-            text = "Wake + speaker test: say ‘Hey Chatty’ and Chatty should answer, “Hi Mike, I’m listening.”"
+            text = "TTS + speaker-routing diagnostics. We already know the Onn microphones and background ‘Hey Chatty’ detection work."
             textSize = 17f
             setPadding(0, gap, 0, gap)
         })
@@ -122,37 +132,57 @@ class MainActivity : AppCompatActivity() {
         })
 
         root.addView(TextView(this).apply {
-            text = "Spoken reply / audio output"
+            text = "Android speech engine test"
+            textSize = 21f
+            setPadding(0, gap * 2, 0, gap)
+        })
+        ttsStatusText = TextView(this).apply {
+            text = "Initializing Android Text-to-Speech…"
+            textSize = 18f
+            setPadding(0, 0, 0, gap)
+        }
+        root.addView(ttsStatusText)
+        root.addView(Button(this).apply {
+            text = "TEST ANDROID VOICE — ‘HI MIKE’"
+            isFocusable = true
+            setOnClickListener { testTtsDirectly() }
+        })
+
+        root.addView(TextView(this).apply {
+            text = "Audio output routing"
             textSize = 21f
             setPadding(0, gap * 2, 0, gap)
         })
         outputStatusText = TextView(this).apply {
-            text = "Choose AUTO or an output below. Use the beep test to identify the Onn’s own speaker."
+            text = "Choose AUTO or an output below."
             textSize = 18f
             setPadding(0, 0, 0, gap)
         }
         root.addView(outputStatusText)
         root.addView(Button(this).apply {
-            text = "PLAY BEEP ON SELECTED OUTPUT"
+            text = "NORMAL BEEP — PREFERRED OUTPUT"
             isFocusable = true
-            setOnClickListener { playOutputTest() }
+            setOnClickListener { playOutputTest(useCommunicationRoute = false) }
+        })
+        root.addView(Button(this).apply {
+            text = "COMMUNICATION-ROUTE BEEP"
+            isFocusable = true
+            setOnClickListener { playOutputTest(useCommunicationRoute = true) }
         })
         outputsContainer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(outputsContainer)
 
         root.addView(TextView(this).apply {
-            text = "Local ‘Hey Chatty’ wake + spoken reply test"
+            text = "Local ‘Hey Chatty’ wake + spoken reply"
             textSize = 21f
             setPadding(0, gap * 2, 0, gap)
         })
-
         wakeText = TextView(this).apply {
             text = "Not started yet."
             textSize = 18f
             setPadding(0, 0, 0, gap)
         }
         root.addView(wakeText)
-
         root.addView(Button(this).apply {
             text = "START ‘HEY CHATTY’ + SPOKEN REPLY TEST"
             isFocusable = true
@@ -179,6 +209,7 @@ class MainActivity : AppCompatActivity() {
             ))
         })
 
+        initTtsDiagnostics()
         validateSelectedOutput()
         renderOutputButtons()
         renderDeviceButtons()
@@ -204,6 +235,90 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
     }
 
+    private fun initTtsDiagnostics() {
+        ttsStatusText.text = "Initializing Android Text-to-Speech…"
+        tts = TextToSpeech(this) { status ->
+            val engine = tts
+            if (status != TextToSpeech.SUCCESS || engine == null) {
+                ttsReady = false
+                runOnUiThread {
+                    ttsStatusText.text = "TTS INIT FAILED — status=$status"
+                }
+                return@TextToSpeech
+            }
+
+            var lang = engine.setLanguage(Locale.CANADA)
+            if (lang == TextToSpeech.LANG_MISSING_DATA || lang == TextToSpeech.LANG_NOT_SUPPORTED) {
+                lang = engine.setLanguage(Locale.US)
+            }
+            ttsReady = lang != TextToSpeech.LANG_MISSING_DATA && lang != TextToSpeech.LANG_NOT_SUPPORTED
+
+            engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {
+                    if (utteranceId == TTS_TEST_ID) runOnUiThread {
+                        ttsStatusText.text = ttsDiagnosticSummary("TTS says it STARTED speaking")
+                    }
+                }
+
+                override fun onDone(utteranceId: String?) {
+                    if (utteranceId == TTS_TEST_ID) runOnUiThread {
+                        ttsStatusText.text = ttsDiagnosticSummary("TTS says playback COMPLETED")
+                        if (!isWakeTestRunning()) startSelectedForegroundMic()
+                    }
+                }
+
+                @Deprecated("Deprecated in Java")
+                override fun onError(utteranceId: String?) {
+                    if (utteranceId == TTS_TEST_ID) runOnUiThread {
+                        ttsStatusText.text = ttsDiagnosticSummary("TTS playback ERROR")
+                    }
+                }
+
+                override fun onError(utteranceId: String?, errorCode: Int) {
+                    if (utteranceId == TTS_TEST_ID) runOnUiThread {
+                        ttsStatusText.text = ttsDiagnosticSummary("TTS playback ERROR code=$errorCode")
+                    }
+                }
+            })
+
+            runOnUiThread {
+                ttsStatusText.text = ttsDiagnosticSummary(
+                    if (ttsReady) "TTS READY" else "TTS engine loaded but English voice unavailable"
+                )
+            }
+        }
+    }
+
+    private fun ttsDiagnosticSummary(prefix: String): String {
+        val engine = tts
+        if (engine == null) return prefix
+        val engineNames = try {
+            engine.engines.joinToString { it.name }
+        } catch (_: Exception) { "unknown" }
+        val voiceName = try { engine.voice?.name ?: "unknown" } catch (_: Exception) { "unknown" }
+        val defaultEngine = try { engine.defaultEngine ?: "unknown" } catch (_: Exception) { "unknown" }
+        return "$prefix\nDefault engine: $defaultEngine\nInstalled engines: $engineNames\nVoice: $voiceName"
+    }
+
+    private fun testTtsDirectly() {
+        stopWakeTest(silent = true)
+        stopForegroundMic()
+        val engine = tts
+        if (!ttsReady || engine == null) {
+            ttsStatusText.text = ttsDiagnosticSummary("TTS is NOT READY")
+            return
+        }
+        val result = engine.speak(
+            "Hi Mike, I'm listening.",
+            TextToSpeech.QUEUE_FLUSH,
+            null,
+            TTS_TEST_ID
+        )
+        ttsStatusText.text = ttsDiagnosticSummary(
+            if (result == TextToSpeech.SUCCESS) "TTS speak() request ACCEPTED" else "TTS speak() request FAILED ($result)"
+        )
+    }
+
     private fun inputDevices(): Array<AudioDeviceInfo> {
         val manager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
         return manager.getDevices(AudioManager.GET_DEVICES_INPUTS)
@@ -224,7 +339,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderOutputButtons() {
         outputsContainer.removeAllViews()
-
         outputsContainer.addView(Button(this).apply {
             text = if (selectedOutputDeviceId == null) "✓ AUTO — ANDROID DEFAULT AUDIO OUTPUT"
             else "AUTO — ANDROID DEFAULT AUDIO OUTPUT"
@@ -234,7 +348,7 @@ class MainActivity : AppCompatActivity() {
                 selectedOutputDeviceId = null
                 getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE).edit().putInt(UI_OUTPUT_ID, -1).apply()
                 renderOutputButtons()
-                outputStatusText.text = "Selected output: AUTO / Android default"
+                outputStatusText.text = communicationSummary("Selected output: AUTO / Android default")
             }
         })
 
@@ -258,43 +372,78 @@ class MainActivity : AppCompatActivity() {
                     selectedOutputDeviceId = device.id
                     getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE).edit().putInt(UI_OUTPUT_ID, device.id).apply()
                     renderOutputButtons()
-                    outputStatusText.text = "Selected output: ${outputDeviceTypeName(device.type)} — ${device.productName} — ID ${device.id}"
+                    outputStatusText.text = communicationSummary(
+                        "Selected output: ${outputDeviceTypeName(device.type)} — ${device.productName} — ID ${device.id}"
+                    )
                 }
             })
         }
     }
 
-    private fun playOutputTest() {
-        val requested = selectedOutputDeviceId?.let { id -> outputDevices().firstOrNull { it.id == id } }
-        if (selectedOutputDeviceId != null && requested == null) {
-            selectedOutputDeviceId = null
-            getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE).edit().putInt(UI_OUTPUT_ID, -1).apply()
-            renderOutputButtons()
+    private fun communicationSummary(prefix: String): String {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return "$prefix\nCommunication-device API: unavailable below Android 12"
         }
+        val available = am.availableCommunicationDevices
+        val current = am.communicationDevice
+        val list = if (available.isEmpty()) "none" else available.joinToString { d ->
+            "${outputDeviceTypeName(d.type)}:${d.productName}(ID ${d.id})"
+        }
+        val currentText = if (current == null) "none" else "${outputDeviceTypeName(current.type)}:${current.productName}(ID ${current.id})"
+        return "$prefix\nCommunication-capable outputs: $list\nCurrent communication route: $currentText"
+    }
 
-        outputStatusText.text = "Playing test beep…"
+    private fun playOutputTest(useCommunicationRoute: Boolean) {
+        stopWakeTest(silent = true)
+        stopForegroundMic()
+        validateSelectedOutput()
+        val requested = selectedOutputDeviceId?.let { id -> outputDevices().firstOrNull { it.id == id } }
+        outputStatusText.text = if (useCommunicationRoute) "Trying communication-route beep…" else "Playing normal preferred-output beep…"
+
         Thread {
-            val sampleRate = 16000
-            val durationSeconds = 0.45
-            val sampleCount = (sampleRate * durationSeconds).toInt()
-            val samples = ShortArray(sampleCount) { i ->
-                val envelope = when {
-                    i < 300 -> i / 300.0
-                    i > sampleCount - 300 -> (sampleCount - i) / 300.0
-                    else -> 1.0
-                }.coerceIn(0.0, 1.0)
-                (sin(2.0 * PI * 740.0 * i / sampleRate) * 9000.0 * envelope).toInt().toShort()
-            }
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val oldMode = am.mode
+            var communicationAccepted: Boolean? = null
+            var communicationRequested: AudioDeviceInfo? = null
 
-            var track: AudioTrack? = null
             try {
-                track = AudioTrack.Builder()
-                    .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                            .build()
-                    )
+                if (useCommunicationRoute) {
+                    am.mode = AudioManager.MODE_IN_COMMUNICATION
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && requested != null) {
+                        communicationRequested = am.availableCommunicationDevices.firstOrNull { it.id == requested.id }
+                        if (communicationRequested != null) {
+                            communicationAccepted = am.setCommunicationDevice(communicationRequested!!)
+                        } else {
+                            communicationAccepted = false
+                        }
+                    } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S && requested?.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER) {
+                        @Suppress("DEPRECATION")
+                        am.isSpeakerphoneOn = true
+                        communicationAccepted = true
+                    }
+                    Thread.sleep(120)
+                }
+
+                val sampleRate = 16000
+                val durationSeconds = 0.65
+                val sampleCount = (sampleRate * durationSeconds).toInt()
+                val samples = ShortArray(sampleCount) { i ->
+                    val envelope = when {
+                        i < 300 -> i / 300.0
+                        i > sampleCount - 300 -> (sampleCount - i) / 300.0
+                        else -> 1.0
+                    }.coerceIn(0.0, 1.0)
+                    (sin(2.0 * PI * 740.0 * i / sampleRate) * 10000.0 * envelope).toInt().toShort()
+                }
+
+                val usage = if (useCommunicationRoute) AudioAttributes.USAGE_VOICE_COMMUNICATION
+                else AudioAttributes.USAGE_ASSISTANCE_SONIFICATION
+                val content = if (useCommunicationRoute) AudioAttributes.CONTENT_TYPE_SPEECH
+                else AudioAttributes.CONTENT_TYPE_SONIFICATION
+
+                val track = AudioTrack.Builder()
+                    .setAudioAttributes(AudioAttributes.Builder().setUsage(usage).setContentType(content).build())
                     .setAudioFormat(
                         AudioFormat.Builder()
                             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
@@ -306,37 +455,58 @@ class MainActivity : AppCompatActivity() {
                     .setTransferMode(AudioTrack.MODE_STATIC)
                     .build()
 
-                val accepted = requested?.let { track.setPreferredDevice(it) } ?: true
-                track.write(samples, 0, samples.size)
-                track.play()
-                Thread.sleep(120)
-                val routed = track.routedDevice
+                try {
+                    val preferredAccepted = requested?.let { track.setPreferredDevice(it) } ?: true
+                    track.write(samples, 0, samples.size)
+                    track.play()
+                    Thread.sleep(180)
+                    val routed = track.routedDevice
+                    val commCurrent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) am.communicationDevice else null
 
-                runOnUiThread {
-                    outputStatusText.text = buildString {
-                        append("Requested: ")
-                        append(if (requested == null) "AUTO / Android default" else "${outputDeviceTypeName(requested.type)} — ${requested.productName} — ID ${requested.id}")
-                        append("\nRouting request accepted: ${if (accepted) "YES" else "NO"}")
-                        append("\nActual routed output: ")
-                        append(if (routed == null) "not reported yet" else "${outputDeviceTypeName(routed.type)} — ${routed.productName} — ID ${routed.id}")
+                    runOnUiThread {
+                        outputStatusText.text = buildString {
+                            append(if (useCommunicationRoute) "COMMUNICATION ROUTE TEST" else "NORMAL ROUTE TEST")
+                            append("\nRequested output: ")
+                            append(if (requested == null) "AUTO" else "${outputDeviceTypeName(requested.type)} — ${requested.productName} — ID ${requested.id}")
+                            append("\nAudioTrack preferred-device accepted: ${if (preferredAccepted) "YES" else "NO"}")
+                            if (useCommunicationRoute) {
+                                append("\nCommunication device match: ")
+                                append(if (communicationRequested == null) "NO matching communication device" else "${communicationRequested!!.productName} — ID ${communicationRequested!!.id}")
+                                append("\nsetCommunicationDevice accepted: ${communicationAccepted?.let { if (it) "YES" else "NO" } ?: "N/A"}")
+                                append("\nCurrent communication route: ")
+                                append(if (commCurrent == null) "none/not reported" else "${outputDeviceTypeName(commCurrent.type)} — ${commCurrent.productName} — ID ${commCurrent.id}")
+                            }
+                            append("\nActual AudioTrack route: ")
+                            append(if (routed == null) "not reported" else "${outputDeviceTypeName(routed.type)} — ${routed.productName} — ID ${routed.id}")
+                        }
                     }
+                    Thread.sleep(650)
+                } finally {
+                    try { track.stop() } catch (_: Exception) {}
+                    try { track.release() } catch (_: Exception) {}
                 }
-                Thread.sleep(450)
             } catch (e: Exception) {
-                runOnUiThread { outputStatusText.text = "Output test failed: ${e.message}" }
+                runOnUiThread { outputStatusText.text = "Output test failed: ${e.javaClass.simpleName}: ${e.message}" }
             } finally {
-                try { track?.stop() } catch (_: Exception) {}
-                try { track?.release() } catch (_: Exception) {}
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    try { am.clearCommunicationDevice() } catch (_: Exception) {}
+                } else {
+                    @Suppress("DEPRECATION")
+                    try { am.isSpeakerphoneOn = false } catch (_: Exception) {}
+                }
+                try { am.mode = oldMode } catch (_: Exception) {}
+                runOnUiThread {
+                    if (!isWakeTestRunning()) startSelectedForegroundMic()
+                }
             }
         }.apply {
-            name = "ChattyOutputTest"
+            name = "ChattyOutputDiagnostics"
             start()
         }
     }
 
     private fun renderDeviceButtons() {
         devicesContainer.removeAllViews()
-
         devicesContainer.addView(Button(this).apply {
             text = if (selectedDeviceId == null) "✓ AUTO — LET ANDROID CHOOSE THE MICROPHONE"
             else "AUTO — LET ANDROID CHOOSE THE MICROPHONE"
@@ -375,6 +545,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startSelectedForegroundMic() {
+        if (isWakeTestRunning()) return
         val selected = selectedDeviceId?.let { id -> inputDevices().firstOrNull { it.id == id } }
         if (selectedDeviceId != null && selected == null) selectedDeviceId = null
         startForegroundMic(selected)
@@ -382,6 +553,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun startForegroundMic(preferredDevice: AudioDeviceInfo?) {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
+        if (isWakeTestRunning()) return
         stopForegroundMic()
 
         val sampleRate = 16000
@@ -460,9 +632,7 @@ class MainActivity : AppCompatActivity() {
             permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
             return
         }
-
         validateSelectedOutput()
-        renderOutputButtons()
         stopForegroundMic()
         getSharedPreferences(BackgroundMicService.PREFS, Context.MODE_PRIVATE).edit().clear().apply()
         val intent = Intent(this, BackgroundMicService::class.java).apply {
@@ -498,16 +668,14 @@ class MainActivity : AppCompatActivity() {
         val wakeCount = p.getInt("wake_count", 0)
         val lastWake = p.getString("last_wake_text", "") ?: ""
         val wakeTime = p.getLong("last_wake_time", 0L)
-        val partial = p.getString("last_partial", "") ?: ""
-        val result = p.getString("last_result", "") ?: ""
-        val peak = p.getInt("last_peak", 0)
-        val maxPeak = p.getInt("max_peak", 0)
         val replyCount = p.getInt("reply_count", 0)
         val replyStatus = p.getString("reply_status", "Not initialized") ?: "Not initialized"
         val replyRoute = p.getString("reply_route", "Not used yet") ?: "Not used yet"
         val replyAccepted = p.getBoolean("reply_route_accepted", true)
         val replyRoutedName = p.getString("reply_routed_name", "Unknown") ?: "Unknown"
         val replyRoutedId = p.getInt("reply_routed_id", -1)
+        val peak = p.getInt("last_peak", 0)
+        val maxPeak = p.getInt("max_peak", 0)
         val error = p.getString("error", "") ?: ""
 
         wakeText.text = buildString {
@@ -521,14 +689,12 @@ class MainActivity : AppCompatActivity() {
                 append("\nLAST WAKE: “$lastWake”")
                 if (wakeTime > 0) append(" at ${DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(wakeTime))}")
             }
-            if (partial.isNotBlank()) append("\nCurrently hearing: “$partial”")
-            if (result.isNotBlank()) append("\nLast completed phrase: “$result”")
             append("\nMic peak: $peak   •   Max: $maxPeak")
-            append("\n\nSpoken replies: $replyCount")
+            append("\n\nSpoken replies attempted: $replyCount")
             append("\nReply status: $replyStatus")
             append("\nRequested reply output: ${if (requestedOutputId < 0) "AUTO" else "ID $requestedOutputId"}")
             append("\nReply route: $replyRoute")
-            if (requestedOutputId >= 0) append("   •   Accepted: ${if (replyAccepted) "YES" else "NO"}")
+            if (requestedOutputId >= 0) append("   •   Preferred accepted: ${if (replyAccepted) "YES" else "NO"}")
             if (replyRoutedId >= 0 || replyRoutedName != "Unknown") {
                 append("\nActual reply output: $replyRoutedName")
                 if (replyRoutedId >= 0) append("   •   ID $replyRoutedId")
@@ -578,6 +744,9 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         handler.removeCallbacks(pollWakeStatus)
         stopForegroundMic()
+        try { tts?.stop() } catch (_: Exception) {}
+        try { tts?.shutdown() } catch (_: Exception) {}
+        tts = null
         super.onDestroy()
     }
 }
