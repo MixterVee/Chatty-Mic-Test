@@ -2,6 +2,7 @@ package com.mixtervee.chattymicttest
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
@@ -26,6 +27,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var activeText: TextView
     private lateinit var devicesContainer: LinearLayout
     private lateinit var levelText: TextView
+    private lateinit var backgroundText: TextView
     private lateinit var meter: ProgressBar
 
     @Volatile private var running = false
@@ -57,11 +59,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Chatty Mic Test v0.2"
+            text = "Chatty Mic Test v0.3"
             textSize = 28f
         }
         val instructions = TextView(this).apply {
-            text = "Choose AUTO or a specific microphone below, then talk toward the device."
+            text = "Foreground: choose AUTO or a specific microphone below. Background: start the test, press Home, speak, then return to Chatty."
             textSize = 17f
             setPadding(0, gap, 0, gap)
         }
@@ -82,6 +84,27 @@ class MainActivity : AppCompatActivity() {
             text = "Refresh audio devices"
             isFocusable = true
             setOnClickListener { refreshDevicesAndStartSelected() }
+        }
+
+        val backgroundHeading = TextView(this).apply {
+            text = "Background listening test"
+            textSize = 21f
+            setPadding(0, gap * 2, 0, gap)
+        }
+        backgroundText = TextView(this).apply {
+            text = "Not started yet."
+            textSize = 18f
+            setPadding(0, 0, 0, gap)
+        }
+        val startBackgroundButton = Button(this).apply {
+            text = "START BACKGROUND MIC TEST"
+            isFocusable = true
+            setOnClickListener { startBackgroundTest() }
+        }
+        val stopBackgroundButton = Button(this).apply {
+            text = "STOP BACKGROUND MIC TEST"
+            isFocusable = true
+            setOnClickListener { stopBackgroundTest() }
         }
 
         val devicesHeading = TextView(this).apply {
@@ -107,6 +130,10 @@ class MainActivity : AppCompatActivity() {
             )
         )
         root.addView(refreshButton)
+        root.addView(backgroundHeading)
+        root.addView(backgroundText)
+        root.addView(startBackgroundButton)
+        root.addView(stopBackgroundButton)
         root.addView(devicesHeading)
         root.addView(devicesContainer)
 
@@ -122,17 +149,27 @@ class MainActivity : AppCompatActivity() {
         setContentView(scrollView)
 
         renderDeviceButtons()
+        updateBackgroundResults()
 
         if (ContextCompat.checkSelfPermission(
                 this,
                 Manifest.permission.RECORD_AUDIO
             ) == PackageManager.PERMISSION_GRANTED
         ) {
-            refreshDevicesAndStartSelected()
+            if (!isBackgroundTestRunning()) {
+                refreshDevicesAndStartSelected()
+            } else {
+                statusText.text = "Background microphone test is running"
+            }
         } else {
             statusText.text = "Requesting microphone permission…"
             permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::backgroundText.isInitialized) updateBackgroundResults()
     }
 
     private fun getInputDevices(): Array<AudioDeviceInfo> {
@@ -151,6 +188,7 @@ class MainActivity : AppCompatActivity() {
             }
             isFocusable = true
             setOnClickListener {
+                stopBackgroundTest(silent = true)
                 selectedDeviceId = null
                 renderDeviceButtons()
                 startMicTest(null)
@@ -183,6 +221,7 @@ class MainActivity : AppCompatActivity() {
                 isAllCaps = false
                 isFocusable = true
                 setOnClickListener {
+                    stopBackgroundTest(silent = true)
                     selectedDeviceId = device.id
                     renderDeviceButtons()
                     startMicTest(device)
@@ -193,6 +232,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun refreshDevicesAndStartSelected() {
+        stopBackgroundTest(silent = true)
         renderDeviceButtons()
         val selected = selectedDeviceId?.let { id ->
             getInputDevices().firstOrNull { it.id == id }
@@ -306,6 +346,76 @@ class MainActivity : AppCompatActivity() {
         }.apply {
             name = "ChattyMicCapture"
             start()
+        }
+    }
+
+    private fun startBackgroundTest() {
+        if (ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.RECORD_AUDIO
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            statusText.text = "Microphone permission is required"
+            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+
+        stopMicTest()
+        val prefs = getSharedPreferences(BackgroundMicService.PREFS, Context.MODE_PRIVATE)
+        prefs.edit()
+            .clear()
+            .putInt("max_peak", 0)
+            .putInt("last_peak", 0)
+            .apply()
+
+        val intent = Intent(this, BackgroundMicService::class.java).apply {
+            action = BackgroundMicService.ACTION_START
+            putExtra(BackgroundMicService.EXTRA_DEVICE_ID, selectedDeviceId ?: -1)
+        }
+        ContextCompat.startForegroundService(this, intent)
+        statusText.text = "Background test started — press Home now"
+        backgroundText.text = "STARTED. Press Home, speak several times from across the room, wait 10–20 seconds, then return to Chatty."
+    }
+
+    private fun stopBackgroundTest(silent: Boolean = false) {
+        val intent = Intent(this, BackgroundMicService::class.java).apply {
+            action = BackgroundMicService.ACTION_STOP
+        }
+        try { startService(intent) } catch (_: Exception) { stopService(Intent(this, BackgroundMicService::class.java)) }
+        if (!silent && ::backgroundText.isInitialized) {
+            updateBackgroundResults()
+            statusText.text = "Background test stopped"
+        }
+    }
+
+    private fun isBackgroundTestRunning(): Boolean {
+        return getSharedPreferences(BackgroundMicService.PREFS, Context.MODE_PRIVATE)
+            .getBoolean("running", false)
+    }
+
+    private fun updateBackgroundResults() {
+        val prefs = getSharedPreferences(BackgroundMicService.PREFS, Context.MODE_PRIVATE)
+        val runningNow = prefs.getBoolean("running", false)
+        val maxPeak = prefs.getInt("max_peak", 0)
+        val lastPeak = prefs.getInt("last_peak", 0)
+        val routedId = prefs.getInt("routed_id", -1)
+        val routedName = prefs.getString("routed_name", "Unknown") ?: "Unknown"
+        val requestedId = prefs.getInt("requested_id", -1)
+        val preferredAccepted = prefs.getBoolean("preferred_accepted", true)
+        val error = prefs.getString("error", "") ?: ""
+        val lastSampleTime = prefs.getLong("last_sample_time", 0L)
+
+        backgroundText.text = buildString {
+            append("Service: ${if (runningNow) "RUNNING" else "STOPPED"}\n")
+            append("Requested input: ${if (requestedId < 0) "AUTO" else "ID $requestedId"}")
+            if (requestedId >= 0) append("   •   Routing accepted: ${if (preferredAccepted) "YES" else "NO"}")
+            append("\n")
+            append("Actual routed input: $routedName")
+            if (routedId >= 0) append("   •   ID $routedId")
+            append("\n")
+            append("Background max peak: $maxPeak   •   Latest peak: $lastPeak")
+            if (lastSampleTime > 0) append("\nAudio samples received: YES")
+            if (error.isNotBlank()) append("\nERROR: $error")
         }
     }
 
