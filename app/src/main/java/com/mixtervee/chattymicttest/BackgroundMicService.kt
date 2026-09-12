@@ -40,6 +40,8 @@ class BackgroundMicService : Service() {
         private const val WAKE_PHRASE = "hey chatty"
         private const val REPLY_TEXT = "Hi Mike, I'm listening."
         private const val REPLY_UTTERANCE_ID = "chatty_direct_reply"
+        private const val QUESTION_TIMEOUT_MS = 12000L
+        private const val QUESTION_SILENCE_MS = 1700L
     }
 
     @Volatile private var running = false
@@ -106,13 +108,13 @@ class BackgroundMicService : Service() {
             tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {
                     if (utteranceId == REPLY_UTTERANCE_ID) {
-                        prefs.edit().putString("reply_status", "Wake TTS callback: STARTED").apply()
+                        prefs.edit().putString("reply_status", "Wake reply speaking").apply()
                     }
                 }
 
                 override fun onDone(utteranceId: String?) {
                     if (utteranceId == REPLY_UTTERANCE_ID) {
-                        prefs.edit().putString("reply_status", "Wake TTS callback: DONE").apply()
+                        prefs.edit().putString("reply_status", "Wake reply completed").apply()
                         replyLatch?.countDown()
                     }
                 }
@@ -120,20 +122,20 @@ class BackgroundMicService : Service() {
                 @Deprecated("Deprecated in Java")
                 override fun onError(utteranceId: String?) {
                     if (utteranceId == REPLY_UTTERANCE_ID) {
-                        prefs.edit().putString("reply_status", "Wake TTS callback: ERROR").apply()
+                        prefs.edit().putString("reply_status", "Wake reply error").apply()
                         replyLatch?.countDown()
                     }
                 }
 
                 override fun onError(utteranceId: String?, errorCode: Int) {
                     if (utteranceId == REPLY_UTTERANCE_ID) {
-                        prefs.edit().putString("reply_status", "Wake TTS callback: ERROR $errorCode").apply()
+                        prefs.edit().putString("reply_status", "Wake reply error $errorCode").apply()
                         replyLatch?.countDown()
                     }
                 }
             })
 
-            prefs.edit().putString("reply_status", "Android TTS READY for wake reply").apply()
+            prefs.edit().putString("reply_status", "Android voice ready").apply()
         }
     }
 
@@ -156,7 +158,10 @@ class BackgroundMicService : Service() {
             .putString("last_result", "")
             .putString("last_wake_text", "")
             .putLong("last_wake_time", 0L)
-            .putString("reply_route", "DEFAULT Android TTS route (same path as manual voice test)")
+            .putString("last_question", "")
+            .putString("question_partial", "")
+            .putString("question_status", "Waiting for wake word")
+            .putString("reply_route", "Android default / TV")
             .putBoolean("reply_route_accepted", true)
             .putString("reply_routed_name", "Android default / TV")
             .putInt("reply_routed_id", -1)
@@ -180,7 +185,7 @@ class BackgroundMicService : Service() {
                 } else {
                     model = loadedModel
                     prefs.edit().putString("recognizer_status", "Offline model ready; opening microphone…").apply()
-                    beginCapture(requestedId, requestedOutputId, loadedModel, myGeneration)
+                    beginCapture(requestedId, loadedModel, myGeneration)
                 }
             },
             { exception ->
@@ -199,7 +204,6 @@ class BackgroundMicService : Service() {
 
     private fun beginCapture(
         requestedId: Int,
-        requestedOutputId: Int,
         loadedModel: Model,
         myGeneration: Int
     ) {
@@ -253,15 +257,14 @@ class BackgroundMicService : Service() {
 
         prefs.edit()
             .putBoolean("preferred_accepted", preferredAccepted)
-            .putString("recognizer_status", "LISTENING locally for ‘Hey Chatty’")
-            .putString("reply_route", "DEFAULT Android TTS route (same path as manual voice test)")
-            .putBoolean("reply_route_accepted", true)
+            .putString("recognizer_status", "LISTENING for ‘Hey Chatty’")
+            .putString("question_status", "Waiting for wake word")
             .apply()
 
         recorder = audioRecord
         recognizer = voskRecognizer
         running = true
-        updateNotification("Listening locally for “Hey Chatty”")
+        updateNotification("Listening for “Hey Chatty”")
 
         worker = Thread {
             val buffer = ShortArray(bufferSize / 2)
@@ -302,23 +305,30 @@ class BackgroundMicService : Service() {
                             .putInt("wake_count", wakeCount)
                             .putString("last_wake_text", heard)
                             .putLong("last_wake_time", now)
+                            .putString("question_status", "Wake word heard")
+                            .putString("question_partial", "")
                             .apply()
-                        updateNotification("HEY CHATTY detected! • Count: $wakeCount")
+                        updateNotification("Hey Chatty detected")
 
-                        // The manual voice test works because the microphone is not holding the
-                        // audio path while Android TTS speaks. Do the same here: temporarily stop
-                        // capture, use TextToSpeech.speak() directly, then resume listening.
                         try { audioRecord.stop() } catch (_: Exception) {}
                         Thread.sleep(150)
                         playDirectTtsReply()
-                        Thread.sleep(200)
+                        Thread.sleep(250)
+
                         if (running && wanted && myGeneration == generation) {
-                            try { audioRecord.startRecording() } catch (e: Exception) {
+                            try {
+                                audioRecord.startRecording()
+                                try { voskRecognizer.reset() } catch (_: Exception) {}
+                                captureQuestion(audioRecord, loadedModel, bufferSize, myGeneration)
+                                try { voskRecognizer.reset() } catch (_: Exception) {}
+                                prefs.edit()
+                                    .putString("recognizer_status", "LISTENING for ‘Hey Chatty’")
+                                    .apply()
+                                updateNotification("Listening for “Hey Chatty”")
+                            } catch (e: Exception) {
                                 prefs.edit().putString("error", "Could not resume microphone after TTS: ${e.message}").apply()
                             }
                         }
-
-                        try { voskRecognizer.reset() } catch (_: Exception) {}
                     }
 
                     val routed = audioRecord.routedDevice
@@ -333,7 +343,7 @@ class BackgroundMicService : Service() {
                         .apply()
 
                     if (now - lastNotificationAt >= 5000 && now - lastWakeAt > 1500) {
-                        updateNotification("Listening locally for “Hey Chatty” • Wakes: $wakeCount")
+                        updateNotification("Listening for “Hey Chatty” • Wakes: $wakeCount")
                         lastNotificationAt = now
                     }
                 }
@@ -350,6 +360,97 @@ class BackgroundMicService : Service() {
         }
     }
 
+    private fun captureQuestion(
+        audioRecord: AudioRecord,
+        loadedModel: Model,
+        bufferSize: Int,
+        myGeneration: Int
+    ) {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val questionRecognizer = try {
+            Recognizer(loadedModel, SAMPLE_RATE.toFloat())
+        } catch (e: Exception) {
+            prefs.edit().putString("question_status", "Question recognizer failed: ${e.message}").apply()
+            return
+        }
+
+        val buffer = ShortArray(bufferSize / 2)
+        val startedAt = System.currentTimeMillis()
+        var lastChangedAt = 0L
+        var lastPartial = ""
+        var captured = ""
+        var heardAnything = false
+
+        prefs.edit()
+            .putString("recognizer_status", "LISTENING for your question")
+            .putString("question_status", "LISTENING — ask your question now")
+            .putString("question_partial", "")
+            .apply()
+        updateNotification("Listening for your question…")
+
+        try {
+            while (running && wanted && myGeneration == generation) {
+                val now = System.currentTimeMillis()
+                if (now - startedAt >= QUESTION_TIMEOUT_MS) break
+
+                val count = audioRecord.read(buffer, 0, buffer.size)
+                if (count <= 0) continue
+
+                val complete = questionRecognizer.acceptWaveForm(buffer, count)
+                if (complete) {
+                    val text = extractText(questionRecognizer.result, "text")
+                    if (text.isNotBlank()) {
+                        captured = text
+                        heardAnything = true
+                        break
+                    }
+                } else {
+                    val partial = extractText(questionRecognizer.partialResult, "partial")
+                    if (partial.isNotBlank()) {
+                        heardAnything = true
+                        if (partial != lastPartial) {
+                            lastPartial = partial
+                            lastChangedAt = now
+                            prefs.edit()
+                                .putString("question_partial", partial)
+                                .putString("question_status", "Hearing: “$partial”")
+                                .apply()
+                        }
+                    }
+                }
+
+                if (heardAnything && lastChangedAt > 0L && now - lastChangedAt >= QUESTION_SILENCE_MS) {
+                    val finalText = extractText(questionRecognizer.finalResult, "text")
+                    captured = if (finalText.isNotBlank()) finalText else lastPartial
+                    break
+                }
+            }
+
+            if (captured.isBlank()) {
+                val finalText = extractText(questionRecognizer.finalResult, "text")
+                captured = if (finalText.isNotBlank()) finalText else lastPartial
+            }
+
+            if (captured.isNotBlank()) {
+                prefs.edit()
+                    .putString("last_question", captured)
+                    .putString("question_status", "CAPTURED")
+                    .putString("question_partial", "")
+                    .apply()
+                updateNotification("You said: $captured")
+            } else {
+                prefs.edit()
+                    .putString("question_status", "No question heard — waiting for ‘Hey Chatty’")
+                    .putString("question_partial", "")
+                    .apply()
+            }
+        } catch (e: Exception) {
+            prefs.edit().putString("question_status", "Question capture error: ${e.message}").apply()
+        } finally {
+            try { questionRecognizer.close() } catch (_: Exception) {}
+        }
+    }
+
     private fun playDirectTtsReply() {
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val tts = textToSpeech
@@ -357,39 +458,30 @@ class BackgroundMicService : Service() {
 
         if (!ttsReady || tts == null) {
             prefs.edit()
-                .putString("reply_status", "Wake TTS requested: NO — speech engine not ready")
+                .putString("reply_status", "Wake reply unavailable — speech engine not ready")
                 .apply()
             return
         }
 
         val latch = CountDownLatch(1)
         replyLatch = latch
-        prefs.edit()
-            .putString("reply_status", "Wake TTS requested: YES — waiting for STARTED callback")
-            .putString("reply_route", "DEFAULT Android TTS route (same path as manual voice test)")
-            .putBoolean("reply_route_accepted", true)
-            .putString("reply_routed_name", "Android default / TV")
-            .putInt("reply_routed_id", -1)
-            .apply()
+        prefs.edit().putString("reply_status", "Starting wake reply…").apply()
 
         val result = try {
             tts.speak(REPLY_TEXT, TextToSpeech.QUEUE_FLUSH, null, REPLY_UTTERANCE_ID)
         } catch (e: Exception) {
-            prefs.edit().putString("reply_status", "Wake TTS speak() exception: ${e.message}").apply()
+            prefs.edit().putString("reply_status", "Wake reply exception: ${e.message}").apply()
             replyLatch = null
             return
         }
 
         if (result != TextToSpeech.SUCCESS) {
-            prefs.edit().putString("reply_status", "Wake TTS speak() request FAILED ($result)").apply()
+            prefs.edit().putString("reply_status", "Wake reply request failed ($result)").apply()
             replyLatch = null
             return
         }
 
-        prefs.edit()
-            .putInt("reply_count", currentReplyCount + 1)
-            .putString("reply_status", "Wake TTS speak() request ACCEPTED")
-            .apply()
+        prefs.edit().putInt("reply_count", currentReplyCount + 1).apply()
 
         val callbackArrived = try {
             latch.await(6, TimeUnit.SECONDS)
@@ -397,7 +489,7 @@ class BackgroundMicService : Service() {
             false
         }
         if (!callbackArrived) {
-            prefs.edit().putString("reply_status", "Wake TTS callback: TIMEOUT after 6 seconds").apply()
+            prefs.edit().putString("reply_status", "Wake reply timed out").apply()
         }
         replyLatch = null
     }
@@ -454,7 +546,7 @@ class BackgroundMicService : Service() {
         manager.createNotificationChannel(
             NotificationChannel(
                 CHANNEL_ID,
-                "Chatty local wake-word test",
+                "Chatty wake-word service",
                 NotificationManager.IMPORTANCE_LOW
             )
         )
