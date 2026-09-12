@@ -24,11 +24,20 @@ jobs:
         with:
           gradle-version: '8.9'
 
+      - name: Add offline English speech model
+        run: |
+          rm -rf app/src/main/assets/model-en-us
+          mkdir -p app/src/main/assets
+          curl -L --fail --retry 3 -o /tmp/vosk-model.zip https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+          unzip -q /tmp/vosk-model.zip -d /tmp/vosk-model
+          mv /tmp/vosk-model/vosk-model-small-en-us-0.15 app/src/main/assets/model-en-us
+          printf 'chatty-vosk-en-us-0.15-v1\n' > app/src/main/assets/model-en-us/uuid
+
       - name: Build debug APK
         run: gradle assembleDebug --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Chatty-Mic-Test-v0.3
+          name: Chatty-Mic-Test-v0.4
           path: app/build/outputs/apk/debug/app-debug.apk
