@@ -10,6 +10,8 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
@@ -19,6 +21,8 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import java.text.DateFormat
+import java.util.Date
 import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
@@ -34,6 +38,14 @@ class MainActivity : AppCompatActivity() {
     private var recorder: AudioRecord? = null
     private var worker: Thread? = null
     private var selectedDeviceId: Int? = null
+
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val pollWakeStatus = object : Runnable {
+        override fun run() {
+            if (::backgroundText.isInitialized) updateBackgroundResults()
+            uiHandler.postDelayed(this, 500)
+        }
+    }
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -59,11 +71,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "Chatty Mic Test v0.3"
+            text = "Chatty Mic Test v0.4"
             textSize = 28f
         }
         val instructions = TextView(this).apply {
-            text = "Foreground: choose AUTO or a specific microphone below. Background: start the test, press Home, speak, then return to Chatty."
+            text = "Wake-word test: start local listening, then say ‘Hey Chatty’. Recognition is performed on the Onn box; no speech is sent to the cloud."
             textSize = 17f
             setPadding(0, gap, 0, gap)
         }
@@ -87,7 +99,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val backgroundHeading = TextView(this).apply {
-            text = "Background listening test"
+            text = "Local ‘Hey Chatty’ wake-word test"
             textSize = 21f
             setPadding(0, gap * 2, 0, gap)
         }
@@ -97,12 +109,12 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, 0, 0, gap)
         }
         val startBackgroundButton = Button(this).apply {
-            text = "START BACKGROUND MIC TEST"
+            text = "START LOCAL ‘HEY CHATTY’ TEST"
             isFocusable = true
             setOnClickListener { startBackgroundTest() }
         }
         val stopBackgroundButton = Button(this).apply {
-            text = "STOP BACKGROUND MIC TEST"
+            text = "STOP LOCAL ‘HEY CHATTY’ TEST"
             isFocusable = true
             setOnClickListener { stopBackgroundTest() }
         }
@@ -159,7 +171,7 @@ class MainActivity : AppCompatActivity() {
             if (!isBackgroundTestRunning()) {
                 refreshDevicesAndStartSelected()
             } else {
-                statusText.text = "Background microphone test is running"
+                statusText.text = "Local wake-word service is running"
             }
         } else {
             statusText.text = "Requesting microphone permission…"
@@ -169,7 +181,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (::backgroundText.isInitialized) updateBackgroundResults()
+        uiHandler.removeCallbacks(pollWakeStatus)
+        uiHandler.post(pollWakeStatus)
+    }
+
+    override fun onPause() {
+        uiHandler.removeCallbacks(pollWakeStatus)
+        super.onPause()
     }
 
     private fun getInputDevices(): Array<AudioDeviceInfo> {
@@ -308,7 +326,7 @@ class MainActivity : AppCompatActivity() {
 
         recorder = audioRecord
         running = true
-        statusText.text = "Listening…"
+        statusText.text = "Foreground mic test listening…"
 
         worker = Thread {
             val buffer = ShortArray(bufferSize / 2)
@@ -362,19 +380,15 @@ class MainActivity : AppCompatActivity() {
 
         stopMicTest()
         val prefs = getSharedPreferences(BackgroundMicService.PREFS, Context.MODE_PRIVATE)
-        prefs.edit()
-            .clear()
-            .putInt("max_peak", 0)
-            .putInt("last_peak", 0)
-            .apply()
+        prefs.edit().clear().apply()
 
         val intent = Intent(this, BackgroundMicService::class.java).apply {
             action = BackgroundMicService.ACTION_START
             putExtra(BackgroundMicService.EXTRA_DEVICE_ID, selectedDeviceId ?: -1)
         }
         ContextCompat.startForegroundService(this, intent)
-        statusText.text = "Background test started — press Home now"
-        backgroundText.text = "STARTED. Press Home, speak several times from across the room, wait 10–20 seconds, then return to Chatty."
+        statusText.text = "Starting local ‘Hey Chatty’ recognition…"
+        backgroundText.text = "Loading the offline speech model. Wait for LISTENING, then say ‘Hey Chatty’. You can press Home and test it from another app too."
     }
 
     private fun stopBackgroundTest(silent: Boolean = false) {
@@ -384,7 +398,7 @@ class MainActivity : AppCompatActivity() {
         try { startService(intent) } catch (_: Exception) { stopService(Intent(this, BackgroundMicService::class.java)) }
         if (!silent && ::backgroundText.isInitialized) {
             updateBackgroundResults()
-            statusText.text = "Background test stopped"
+            statusText.text = "Local wake-word test stopped"
         }
     }
 
@@ -404,16 +418,32 @@ class MainActivity : AppCompatActivity() {
         val preferredAccepted = prefs.getBoolean("preferred_accepted", true)
         val error = prefs.getString("error", "") ?: ""
         val lastSampleTime = prefs.getLong("last_sample_time", 0L)
+        val recognizerStatus = prefs.getString("recognizer_status", "Not started") ?: "Not started"
+        val wakeCount = prefs.getInt("wake_count", 0)
+        val lastPartial = prefs.getString("last_partial", "") ?: ""
+        val lastResult = prefs.getString("last_result", "") ?: ""
+        val lastWakeText = prefs.getString("last_wake_text", "") ?: ""
+        val lastWakeTime = prefs.getLong("last_wake_time", 0L)
 
         backgroundText.text = buildString {
             append("Service: ${if (runningNow) "RUNNING" else "STOPPED"}\n")
+            append("Recognizer: $recognizerStatus\n")
             append("Requested input: ${if (requestedId < 0) "AUTO" else "ID $requestedId"}")
             if (requestedId >= 0) append("   •   Routing accepted: ${if (preferredAccepted) "YES" else "NO"}")
             append("\n")
             append("Actual routed input: $routedName")
             if (routedId >= 0) append("   •   ID $routedId")
             append("\n")
-            append("Background max peak: $maxPeak   •   Latest peak: $lastPeak")
+            append("Wake phrase detections: $wakeCount")
+            if (lastWakeText.isNotBlank()) {
+                append("\nLAST WAKE: “$lastWakeText”")
+                if (lastWakeTime > 0) {
+                    append(" at ${DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(lastWakeTime))}")
+                }
+            }
+            if (lastPartial.isNotBlank()) append("\nCurrently hearing: “$lastPartial”")
+            if (lastResult.isNotBlank()) append("\nLast completed phrase: “$lastResult”")
+            append("\nMic peak: $lastPeak   •   Max: $maxPeak")
             if (lastSampleTime > 0) append("\nAudio samples received: YES")
             if (error.isNotBlank()) append("\nERROR: $error")
         }
@@ -427,6 +457,9 @@ class MainActivity : AppCompatActivity() {
         AudioDeviceInfo.TYPE_WIRED_HEADSET -> "Wired headset microphone"
         AudioDeviceInfo.TYPE_BLE_HEADSET -> "Bluetooth LE headset"
         AudioDeviceInfo.TYPE_TELEPHONY -> "Telephony input"
+        AudioDeviceInfo.TYPE_REMOTE_SUBMIX -> "Remote submix"
+        AudioDeviceInfo.TYPE_TV_TUNER -> "TV tuner input"
+        AudioDeviceInfo.TYPE_ECHO_REFERENCE -> "Echo reference"
         else -> "Audio device type $type"
     }
 
@@ -443,6 +476,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        uiHandler.removeCallbacks(pollWakeStatus)
         stopMicTest()
         super.onDestroy()
     }
