@@ -51,7 +51,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         root.addView(TextView(this).apply {
-            text = "Chatty Mic Test v0.8"
+            text = "Chatty Mic Test v0.9"
             textSize = 30f
         })
 
@@ -174,6 +174,7 @@ class MainActivity : AppCompatActivity() {
         val wakeTime = p.getLong("last_wake_time", 0L)
         val replyStatus = p.getString("reply_status", "Not initialized") ?: "Not initialized"
         val questionStatus = p.getString("question_status", "Waiting for wake word") ?: "Waiting for wake word"
+        val questionEngine = p.getString("question_engine", "Android / Google speech recognition") ?: "Android / Google speech recognition"
         val questionPartial = p.getString("question_partial", "") ?: ""
         val lastQuestion = p.getString("last_question", "") ?: ""
         val error = p.getString("error", "") ?: ""
@@ -201,6 +202,7 @@ class MainActivity : AppCompatActivity() {
             }
             append("\nWake recognizer: $recognizerStatus")
             append("\nVoice reply: $replyStatus")
+            append("\nQuestion engine: $questionEngine")
             append("\nQuestion capture: $questionStatus")
             if (error.isNotBlank()) append("\nERROR: $error")
         }
