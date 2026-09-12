@@ -13,7 +13,13 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import androidx.core.app.NotificationCompat
@@ -25,6 +31,9 @@ import org.vosk.android.StorageService
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 
 class BackgroundMicService : Service() {
@@ -40,14 +49,23 @@ class BackgroundMicService : Service() {
         private const val WAKE_PHRASE = "hey chatty"
         private const val REPLY_TEXT = "Hi Mike, I'm listening."
         private const val REPLY_UTTERANCE_ID = "chatty_direct_reply"
-        private const val QUESTION_TIMEOUT_MS = 12000L
-        private const val QUESTION_SILENCE_MS = 1700L
+        private const val ANDROID_SPEECH_TIMEOUT_MS = 16000L
+        private const val VOSK_FALLBACK_TIMEOUT_MS = 12000L
+        private const val VOSK_FALLBACK_SILENCE_MS = 1900L
     }
+
+    private data class AndroidSpeechResult(
+        val text: String = "",
+        val errorCode: Int = 0,
+        val errorText: String = "",
+        val useVoskFallback: Boolean = false
+    )
 
     @Volatile private var running = false
     @Volatile private var wanted = false
     @Volatile private var ttsReady = false
     @Volatile private var replyLatch: CountDownLatch? = null
+    @Volatile private var questionLatch: CountDownLatch? = null
 
     private var recorder: AudioRecord? = null
     private var recognizer: Recognizer? = null
@@ -55,6 +73,8 @@ class BackgroundMicService : Service() {
     private var worker: Thread? = null
     private var generation = 0
     private var textToSpeech: TextToSpeech? = null
+    private var activeSpeechRecognizer: SpeechRecognizer? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -161,6 +181,7 @@ class BackgroundMicService : Service() {
             .putString("last_question", "")
             .putString("question_partial", "")
             .putString("question_status", "Waiting for wake word")
+            .putString("question_engine", "Android / Google speech recognition")
             .putString("reply_route", "Android default / TV")
             .putBoolean("reply_route_accepted", true)
             .putString("reply_routed_name", "Android default / TV")
@@ -310,6 +331,8 @@ class BackgroundMicService : Service() {
                             .apply()
                         updateNotification("Hey Chatty detected")
 
+                        // Release the active microphone capture before TTS and Android's
+                        // SpeechRecognizer take turns using the same microphone.
                         try { audioRecord.stop() } catch (_: Exception) {}
                         Thread.sleep(150)
                         playDirectTtsReply()
@@ -317,16 +340,21 @@ class BackgroundMicService : Service() {
 
                         if (running && wanted && myGeneration == generation) {
                             try {
-                                audioRecord.startRecording()
                                 try { voskRecognizer.reset() } catch (_: Exception) {}
                                 captureQuestion(audioRecord, loadedModel, bufferSize, myGeneration)
-                                try { voskRecognizer.reset() } catch (_: Exception) {}
-                                prefs.edit()
-                                    .putString("recognizer_status", "LISTENING for ‘Hey Chatty’")
-                                    .apply()
-                                updateNotification("Listening for “Hey Chatty”")
+
+                                if (running && wanted && myGeneration == generation) {
+                                    if (audioRecord.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                                        audioRecord.startRecording()
+                                    }
+                                    try { voskRecognizer.reset() } catch (_: Exception) {}
+                                    prefs.edit()
+                                        .putString("recognizer_status", "LISTENING for ‘Hey Chatty’")
+                                        .apply()
+                                    updateNotification("Listening for “Hey Chatty”")
+                                }
                             } catch (e: Exception) {
-                                prefs.edit().putString("error", "Could not resume microphone after TTS: ${e.message}").apply()
+                                prefs.edit().putString("error", "Could not resume microphone after question: ${e.message}").apply()
                             }
                         }
                     }
@@ -367,31 +395,252 @@ class BackgroundMicService : Service() {
         myGeneration: Int
     ) {
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+        prefs.edit()
+            .putString("recognizer_status", "LISTENING for your question")
+            .putString("question_engine", "Android / Google speech recognition")
+            .putString("question_status", "Starting Android speech recognition…")
+            .putString("question_partial", "")
+            .apply()
+        updateNotification("Listening for your question…")
+
+        val androidResult = captureQuestionWithAndroidSpeech(myGeneration)
+        if (androidResult.text.isNotBlank()) {
+            saveCapturedQuestion(androidResult.text, "Android / Google speech recognition")
+            return
+        }
+
+        if (!running || !wanted || myGeneration != generation) return
+
+        if (androidResult.useVoskFallback) {
+            prefs.edit()
+                .putString("question_engine", "Vosk offline fallback")
+                .putString(
+                    "question_status",
+                    "Android speech unavailable (${androidResult.errorText}); using offline fallback…"
+                )
+                .putString("question_partial", "")
+                .apply()
+            updateNotification("Using offline question fallback…")
+
+            try {
+                if (audioRecord.recordingState != AudioRecord.RECORDSTATE_RECORDING) {
+                    audioRecord.startRecording()
+                }
+                val fallbackText = captureQuestionWithVosk(
+                    audioRecord,
+                    loadedModel,
+                    bufferSize,
+                    myGeneration
+                )
+                if (fallbackText.isNotBlank()) {
+                    saveCapturedQuestion(fallbackText, "Vosk offline fallback")
+                } else {
+                    prefs.edit()
+                        .putString("question_status", "No question heard — waiting for ‘Hey Chatty’")
+                        .putString("question_partial", "")
+                        .apply()
+                }
+            } catch (e: Exception) {
+                prefs.edit().putString("question_status", "Offline fallback error: ${e.message}").apply()
+            }
+            return
+        }
+
+        prefs.edit()
+            .putString(
+                "question_status",
+                if (androidResult.errorText.isBlank()) {
+                    "No question heard — waiting for ‘Hey Chatty’"
+                } else {
+                    "Android speech: ${androidResult.errorText}"
+                }
+            )
+            .putString("question_partial", "")
+            .apply()
+    }
+
+    private fun captureQuestionWithAndroidSpeech(myGeneration: Int): AndroidSpeechResult {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val latch = CountDownLatch(1)
+        questionLatch = latch
+
+        val finished = AtomicBoolean(false)
+        val resultText = AtomicReference("")
+        val lastPartial = AtomicReference("")
+        val errorCode = AtomicInteger(0)
+        val errorText = AtomicReference("")
+        val shouldFallback = AtomicBoolean(false)
+
+        fun finishOnce() {
+            if (finished.compareAndSet(false, true)) latch.countDown()
+        }
+
+        mainHandler.post {
+            if (!running || !wanted || myGeneration != generation) {
+                errorText.set("cancelled")
+                finishOnce()
+                return@post
+            }
+
+            if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                errorText.set("no Android speech service")
+                shouldFallback.set(true)
+                prefs.edit().putString("question_status", "Android speech service not available").apply()
+                finishOnce()
+                return@post
+            }
+
+            try {
+                destroyActiveSpeechRecognizerOnMain()
+                val speech = SpeechRecognizer.createSpeechRecognizer(this)
+                activeSpeechRecognizer = speech
+
+                speech.setRecognitionListener(object : RecognitionListener {
+                    override fun onReadyForSpeech(params: Bundle?) {
+                        if (!finished.get()) {
+                            prefs.edit().putString("question_status", "LISTENING — ask your question now").apply()
+                        }
+                    }
+
+                    override fun onBeginningOfSpeech() {
+                        if (!finished.get()) {
+                            prefs.edit().putString("question_status", "Hearing you…").apply()
+                        }
+                    }
+
+                    override fun onRmsChanged(rmsdB: Float) = Unit
+                    override fun onBufferReceived(buffer: ByteArray?) = Unit
+
+                    override fun onEndOfSpeech() {
+                        if (!finished.get()) {
+                            prefs.edit().putString("question_status", "Processing what you said…").apply()
+                        }
+                    }
+
+                    override fun onError(error: Int) {
+                        if (finished.get()) return
+                        errorCode.set(error)
+                        val description = speechErrorText(error)
+                        errorText.set(description)
+
+                        val partial = lastPartial.get().trim()
+                        if (partial.isNotBlank() && (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT)) {
+                            resultText.set(partial)
+                        } else {
+                            shouldFallback.set(
+                                error == SpeechRecognizer.ERROR_AUDIO ||
+                                    error == SpeechRecognizer.ERROR_CLIENT ||
+                                    error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS ||
+                                    error == SpeechRecognizer.ERROR_NETWORK ||
+                                    error == SpeechRecognizer.ERROR_NETWORK_TIMEOUT ||
+                                    error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY ||
+                                    error == SpeechRecognizer.ERROR_SERVER
+                            )
+                        }
+                        prefs.edit().putString("question_status", "Android speech: $description").apply()
+                        finishOnce()
+                    }
+
+                    override fun onResults(results: Bundle?) {
+                        if (finished.get()) return
+                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        val best = matches?.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+                        resultText.set(best)
+                        if (best.isBlank()) errorText.set("no match")
+                        finishOnce()
+                    }
+
+                    override fun onPartialResults(partialResults: Bundle?) {
+                        if (finished.get()) return
+                        val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        val partial = matches?.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+                        if (partial.isNotBlank()) {
+                            lastPartial.set(partial)
+                            prefs.edit()
+                                .putString("question_partial", partial)
+                                .putString("question_status", "Hearing: “$partial”")
+                                .apply()
+                        }
+                    }
+
+                    override fun onEvent(eventType: Int, params: Bundle?) = Unit
+                })
+
+                val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.CANADA.toLanguageTag())
+                    putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 500L)
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1300L)
+                    putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 900L)
+                }
+                speech.startListening(intent)
+            } catch (e: Exception) {
+                errorText.set("${e.javaClass.simpleName}: ${e.message ?: "start failed"}")
+                shouldFallback.set(true)
+                prefs.edit().putString("question_status", "Android speech could not start").apply()
+                finishOnce()
+            }
+        }
+
+        val completed = try {
+            latch.await(ANDROID_SPEECH_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            false
+        }
+
+        if (!completed) {
+            errorCode.set(-1)
+            errorText.set("timed out")
+            shouldFallback.set(true)
+            finished.set(true)
+            prefs.edit().putString("question_status", "Android speech timed out").apply()
+        }
+
+        questionLatch = null
+        mainHandler.post { destroyActiveSpeechRecognizerOnMain() }
+
+        return AndroidSpeechResult(
+            text = resultText.get().trim().lowercase(),
+            errorCode = errorCode.get(),
+            errorText = errorText.get(),
+            useVoskFallback = shouldFallback.get()
+        )
+    }
+
+    private fun captureQuestionWithVosk(
+        audioRecord: AudioRecord,
+        loadedModel: Model,
+        bufferSize: Int,
+        myGeneration: Int
+    ): String {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val questionRecognizer = try {
             Recognizer(loadedModel, SAMPLE_RATE.toFloat())
         } catch (e: Exception) {
-            prefs.edit().putString("question_status", "Question recognizer failed: ${e.message}").apply()
-            return
+            prefs.edit().putString("question_status", "Offline recognizer failed: ${e.message}").apply()
+            return ""
         }
 
         val buffer = ShortArray(bufferSize / 2)
         val startedAt = System.currentTimeMillis()
         var lastChangedAt = 0L
         var lastPartial = ""
-        var captured = ""
+        val completedSegments = mutableListOf<String>()
         var heardAnything = false
 
         prefs.edit()
-            .putString("recognizer_status", "LISTENING for your question")
-            .putString("question_status", "LISTENING — ask your question now")
+            .putString("question_status", "LISTENING — offline fallback")
             .putString("question_partial", "")
             .apply()
-        updateNotification("Listening for your question…")
 
-        try {
+        return try {
             while (running && wanted && myGeneration == generation) {
                 val now = System.currentTimeMillis()
-                if (now - startedAt >= QUESTION_TIMEOUT_MS) break
+                if (now - startedAt >= VOSK_FALLBACK_TIMEOUT_MS) break
 
                 val count = audioRecord.read(buffer, 0, buffer.size)
                 if (count <= 0) continue
@@ -400,9 +649,16 @@ class BackgroundMicService : Service() {
                 if (complete) {
                     val text = extractText(questionRecognizer.result, "text")
                     if (text.isNotBlank()) {
-                        captured = text
+                        completedSegments.add(text)
                         heardAnything = true
-                        break
+                        lastChangedAt = now
+                        val combined = (completedSegments + lastPartial.takeIf { it.isNotBlank() }.orEmpty())
+                            .filter { it.isNotBlank() }
+                            .joinToString(" ")
+                        prefs.edit()
+                            .putString("question_partial", combined)
+                            .putString("question_status", "Hearing: “$combined”")
+                            .apply()
                     }
                 } else {
                     val partial = extractText(questionRecognizer.partialResult, "partial")
@@ -411,44 +667,65 @@ class BackgroundMicService : Service() {
                         if (partial != lastPartial) {
                             lastPartial = partial
                             lastChangedAt = now
+                            val combined = (completedSegments + partial).joinToString(" ").trim()
                             prefs.edit()
-                                .putString("question_partial", partial)
-                                .putString("question_status", "Hearing: “$partial”")
+                                .putString("question_partial", combined)
+                                .putString("question_status", "Hearing: “$combined”")
                                 .apply()
                         }
                     }
                 }
 
-                if (heardAnything && lastChangedAt > 0L && now - lastChangedAt >= QUESTION_SILENCE_MS) {
-                    val finalText = extractText(questionRecognizer.finalResult, "text")
-                    captured = if (finalText.isNotBlank()) finalText else lastPartial
+                if (heardAnything && lastChangedAt > 0L && now - lastChangedAt >= VOSK_FALLBACK_SILENCE_MS) {
                     break
                 }
             }
 
-            if (captured.isBlank()) {
-                val finalText = extractText(questionRecognizer.finalResult, "text")
-                captured = if (finalText.isNotBlank()) finalText else lastPartial
-            }
-
-            if (captured.isNotBlank()) {
-                prefs.edit()
-                    .putString("last_question", captured)
-                    .putString("question_status", "CAPTURED")
-                    .putString("question_partial", "")
-                    .apply()
-                updateNotification("You said: $captured")
-            } else {
-                prefs.edit()
-                    .putString("question_status", "No question heard — waiting for ‘Hey Chatty’")
-                    .putString("question_partial", "")
-                    .apply()
-            }
+            val finalText = extractText(questionRecognizer.finalResult, "text")
+            val pieces = mutableListOf<String>()
+            pieces.addAll(completedSegments)
+            if (finalText.isNotBlank()) pieces.add(finalText)
+            else if (lastPartial.isNotBlank()) pieces.add(lastPartial)
+            pieces.joinToString(" ").replace(Regex("\\s+"), " ").trim()
         } catch (e: Exception) {
-            prefs.edit().putString("question_status", "Question capture error: ${e.message}").apply()
+            prefs.edit().putString("question_status", "Offline capture error: ${e.message}").apply()
+            ""
         } finally {
             try { questionRecognizer.close() } catch (_: Exception) {}
         }
+    }
+
+    private fun saveCapturedQuestion(text: String, engine: String) {
+        val cleaned = text.trim().replace(Regex("\\s+"), " ")
+        if (cleaned.isBlank()) return
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString("last_question", cleaned)
+            .putString("question_engine", engine)
+            .putString("question_status", "CAPTURED")
+            .putString("question_partial", "")
+            .apply()
+        updateNotification("You said: $cleaned")
+    }
+
+    private fun speechErrorText(error: Int): String = when (error) {
+        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "network timeout"
+        SpeechRecognizer.ERROR_NETWORK -> "network error"
+        SpeechRecognizer.ERROR_AUDIO -> "microphone/audio error"
+        SpeechRecognizer.ERROR_SERVER -> "speech server error"
+        SpeechRecognizer.ERROR_CLIENT -> "speech client error"
+        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "no speech heard"
+        SpeechRecognizer.ERROR_NO_MATCH -> "couldn't understand that"
+        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "speech recognizer busy"
+        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "microphone permission denied"
+        else -> "speech error $error"
+    }
+
+    private fun destroyActiveSpeechRecognizerOnMain() {
+        val speech = activeSpeechRecognizer ?: return
+        activeSpeechRecognizer = null
+        try { speech.cancel() } catch (_: Exception) {}
+        try { speech.destroy() } catch (_: Exception) {}
     }
 
     private fun playDirectTtsReply() {
@@ -556,6 +833,10 @@ class BackgroundMicService : Service() {
         running = false
         replyLatch?.countDown()
         replyLatch = null
+        questionLatch?.countDown()
+        questionLatch = null
+        mainHandler.post { destroyActiveSpeechRecognizerOnMain() }
+
         val oldRecorder = recorder
         val oldRecognizer = recognizer
         val oldWorker = worker
