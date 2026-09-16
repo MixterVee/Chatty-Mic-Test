@@ -51,12 +51,12 @@ class MainActivity : AppCompatActivity() {
         }
 
         root.addView(TextView(this).apply {
-            text = "Chatty Mic Test v0.11"
+            text = "Chatty Mic Test v${BuildConfig.VERSION_NAME}"
             textSize = 30f
         })
 
         root.addView(TextView(this).apply {
-            text = "Say “Hey Chatty”. After Chatty replies, ask naturally — short pauses should no longer end your question."
+            text = "Say “Hey Chatty”. After Chatty replies, ask naturally — you can pause for a few seconds while speaking."
             textSize = 19f
             setPadding(0, gap, 0, gap * 2)
         })
@@ -132,7 +132,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun ensurePermissionAndStart() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
             startChatty()
         } else {
             permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
@@ -174,14 +176,16 @@ class MainActivity : AppCompatActivity() {
         val wakeTime = p.getLong("last_wake_time", 0L)
         val replyStatus = p.getString("reply_status", "Not initialized") ?: "Not initialized"
         val questionStatus = p.getString("question_status", "Waiting for wake word") ?: "Waiting for wake word"
-        val questionEngine = p.getString("question_engine", "Android / Google speech recognition") ?: "Android / Google speech recognition"
+        val questionEngine = p.getString("question_engine", "Android / Google speech recognition")
+            ?: "Android / Google speech recognition"
         val questionPartial = p.getString("question_partial", "") ?: ""
         val lastQuestion = p.getString("last_question", "") ?: ""
         val error = p.getString("error", "") ?: ""
 
         statusText.text = when {
             error.isNotBlank() -> "Chatty needs attention"
-            running && recognizerStatus.contains("your question", ignoreCase = true) -> "🎤 Listening to your question…"
+            running && recognizerStatus.contains("your question", ignoreCase = true) ->
+                "🎤 Listening to your question…"
             running -> "● Chatty is listening for “Hey Chatty”"
             else -> "Chatty is stopped"
         }
