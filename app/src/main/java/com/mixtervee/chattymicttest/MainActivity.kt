@@ -51,7 +51,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         root.addView(TextView(this).apply {
-            text = "Chatty Mic Test v0.12"
+            text = "Chatty Mic Test v0.13"
             textSize = 30f
         })
 
