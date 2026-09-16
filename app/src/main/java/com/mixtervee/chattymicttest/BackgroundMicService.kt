@@ -51,13 +51,14 @@ class BackgroundMicService : Service() {
         private const val WAKE_PHRASE = "hey chatty"
         private const val REPLY_TEXT = "Hi Mike, I'm listening."
         private const val REPLY_UTTERANCE_ID = "chatty_direct_reply"
+        private const val TTS_INIT_WAIT_MS = 5000L
+        private const val RECOGNIZER_CHIME_MUTE_MS = 850L
+        private const val RECOGNIZER_CHIME_READY_DELAY_MS = 300L
 
-        // v0.12 keeps one Android SpeechRecognizer instance alive for the whole
-        // question. If the service ends a chunk at a short pause, the same recognizer
-        // is restarted on the next main-loop tick instead of being destroyed/recreated.
-        // Android 13+ also gets segmented-session mode when the installed recognizer
-        // supports it. A question is considered finished after a real pause of about
-        // 3.5 seconds, not after the recognizer's own short endpoint.
+        // v0.13 keeps v0.12's pause-tolerant recognizer, but fixes two rough edges:
+        // wait for Android TTS to finish initializing before the FIRST wake reply, and
+        // briefly mute the TV's media stream only while Android speech recognition is
+        // re-armed so its start/transition chime does not sound like Chatty stopped.
         private const val QUESTION_MAX_DURATION_MS = 40000L
         private const val QUESTION_END_PAUSE_MS = 3500L
         private const val MAX_ANDROID_SESSIONS = 20
@@ -83,7 +84,9 @@ class BackgroundMicService : Service() {
     @Volatile private var ttsReady = false
     @Volatile private var replyLatch: CountDownLatch? = null
     @Volatile private var questionLatch: CountDownLatch? = null
+    @Volatile private var recognitionAudioMutedByUs = false
 
+    private val ttsInitLatch = CountDownLatch(1)
     private var recorder: AudioRecord? = null
     private var recognizer: Recognizer? = null
     private var model: Model? = null
@@ -92,6 +95,7 @@ class BackgroundMicService : Service() {
     private var textToSpeech: TextToSpeech? = null
     private var activeSpeechRecognizer: SpeechRecognizer? = null
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val restoreRecognitionAudioRunnable = Runnable { restoreRecognitionAudio() }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -123,58 +127,64 @@ class BackgroundMicService : Service() {
         prefs.edit().putString("reply_status", "Initializing Android speech engine…").apply()
 
         textToSpeech = TextToSpeech(this) { status ->
-            val tts = textToSpeech
-            if (status != TextToSpeech.SUCCESS || tts == null) {
-                ttsReady = false
-                prefs.edit().putString("reply_status", "Android speech engine failed to initialize").apply()
-                return@TextToSpeech
+            try {
+                val tts = textToSpeech
+                if (status != TextToSpeech.SUCCESS || tts == null) {
+                    ttsReady = false
+                    prefs.edit()
+                        .putString("reply_status", "Android speech engine failed to initialize")
+                        .apply()
+                    return@TextToSpeech
+                }
+
+                var languageResult = tts.setLanguage(Locale.CANADA)
+                if (languageResult == TextToSpeech.LANG_MISSING_DATA ||
+                    languageResult == TextToSpeech.LANG_NOT_SUPPORTED
+                ) {
+                    languageResult = tts.setLanguage(Locale.US)
+                }
+                ttsReady = languageResult != TextToSpeech.LANG_MISSING_DATA &&
+                    languageResult != TextToSpeech.LANG_NOT_SUPPORTED
+
+                if (!ttsReady) {
+                    prefs.edit().putString("reply_status", "English speech voice is unavailable").apply()
+                    return@TextToSpeech
+                }
+
+                tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) {
+                        if (utteranceId == REPLY_UTTERANCE_ID) {
+                            prefs.edit().putString("reply_status", "Wake reply speaking").apply()
+                        }
+                    }
+
+                    override fun onDone(utteranceId: String?) {
+                        if (utteranceId == REPLY_UTTERANCE_ID) {
+                            prefs.edit().putString("reply_status", "Wake reply completed").apply()
+                            replyLatch?.countDown()
+                        }
+                    }
+
+                    @Deprecated("Deprecated in Java")
+                    override fun onError(utteranceId: String?) {
+                        if (utteranceId == REPLY_UTTERANCE_ID) {
+                            prefs.edit().putString("reply_status", "Wake reply error").apply()
+                            replyLatch?.countDown()
+                        }
+                    }
+
+                    override fun onError(utteranceId: String?, errorCode: Int) {
+                        if (utteranceId == REPLY_UTTERANCE_ID) {
+                            prefs.edit().putString("reply_status", "Wake reply error $errorCode").apply()
+                            replyLatch?.countDown()
+                        }
+                    }
+                })
+
+                prefs.edit().putString("reply_status", "Android voice ready").apply()
+            } finally {
+                ttsInitLatch.countDown()
             }
-
-            var languageResult = tts.setLanguage(Locale.CANADA)
-            if (languageResult == TextToSpeech.LANG_MISSING_DATA ||
-                languageResult == TextToSpeech.LANG_NOT_SUPPORTED
-            ) {
-                languageResult = tts.setLanguage(Locale.US)
-            }
-            ttsReady = languageResult != TextToSpeech.LANG_MISSING_DATA &&
-                languageResult != TextToSpeech.LANG_NOT_SUPPORTED
-
-            if (!ttsReady) {
-                prefs.edit().putString("reply_status", "English speech voice is unavailable").apply()
-                return@TextToSpeech
-            }
-
-            tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {
-                    if (utteranceId == REPLY_UTTERANCE_ID) {
-                        prefs.edit().putString("reply_status", "Wake reply speaking").apply()
-                    }
-                }
-
-                override fun onDone(utteranceId: String?) {
-                    if (utteranceId == REPLY_UTTERANCE_ID) {
-                        prefs.edit().putString("reply_status", "Wake reply completed").apply()
-                        replyLatch?.countDown()
-                    }
-                }
-
-                @Deprecated("Deprecated in Java")
-                override fun onError(utteranceId: String?) {
-                    if (utteranceId == REPLY_UTTERANCE_ID) {
-                        prefs.edit().putString("reply_status", "Wake reply error").apply()
-                        replyLatch?.countDown()
-                    }
-                }
-
-                override fun onError(utteranceId: String?, errorCode: Int) {
-                    if (utteranceId == REPLY_UTTERANCE_ID) {
-                        prefs.edit().putString("reply_status", "Wake reply error $errorCode").apply()
-                        replyLatch?.countDown()
-                    }
-                }
-            })
-
-            prefs.edit().putString("reply_status", "Android voice ready").apply()
         }
     }
 
@@ -354,8 +364,6 @@ class BackgroundMicService : Service() {
                             .apply()
                         updateNotification("Hey Chatty detected")
 
-                        // v0.7's proven route: release our AudioRecord while Android TTS
-                        // speaks, then let Android/Google speech recognition own the mic.
                         try { audioRecord.stop() } catch (_: Exception) {}
                         Thread.sleep(150)
                         playDirectTtsReply()
@@ -539,6 +547,7 @@ class BackgroundMicService : Service() {
                 fun finishOnce(text: String = combinedQuestion, code: Int = 0, message: String = "") {
                     if (!finished.compareAndSet(false, true)) return
                     cancelPauseFinish()
+                    restoreRecognitionAudio()
                     finalText.set(text.trim())
                     if (code != 0) errorCode.set(code)
                     if (message.isNotBlank()) errorText.set(message)
@@ -604,6 +613,7 @@ class BackgroundMicService : Service() {
                 val listener = object : RecognitionListener {
                     override fun onReadyForSpeech(params: Bundle?) {
                         if (!finished.get()) {
+                            scheduleRecognitionAudioRestore(RECOGNIZER_CHIME_READY_DELAY_MS)
                             val status = if (combinedQuestion.isBlank()) {
                                 "LISTENING — ask your question now"
                             } else {
@@ -615,6 +625,7 @@ class BackgroundMicService : Service() {
 
                     override fun onBeginningOfSpeech() {
                         if (!finished.get()) {
+                            scheduleRecognitionAudioRestore(0L)
                             cancelPauseFinish()
                             prefs.edit().putString("question_status", "Hearing you…").apply()
                         }
@@ -625,6 +636,7 @@ class BackgroundMicService : Service() {
 
                     override fun onEndOfSpeech() {
                         if (!finished.get()) {
+                            muteRecognitionChimeBriefly()
                             prefs.edit()
                                 .putString("question_status", "Pause detected — still listening…")
                                 .apply()
@@ -656,9 +668,6 @@ class BackgroundMicService : Service() {
                                 scheduleFinishAfterRealPause()
                             }
 
-                            // Re-arm immediately on the next main-loop turn. This is the
-                            // key v0.12 change: same SpeechRecognizer, no destroy/create,
-                            // and no deliberate 100 ms handoff gap.
                             mainHandler.post { startNextSession() }
                             return
                         }
@@ -697,8 +706,6 @@ class BackgroundMicService : Service() {
                             }
                         }
 
-                        // A non-segmented recognizer may deliver onResults after every
-                        // short pause. Re-arm the SAME instance immediately.
                         mainHandler.post { startNextSession() }
                     }
 
@@ -707,6 +714,7 @@ class BackgroundMicService : Service() {
                         val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         val partial = matches?.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
                         if (partial.isNotBlank()) {
+                            scheduleRecognitionAudioRestore(0L)
                             cancelPauseFinish()
                             lastPartial = partial
                             val preview = mergeSpeechSegment(combinedQuestion, partial)
@@ -731,14 +739,12 @@ class BackgroundMicService : Service() {
 
                     override fun onEndOfSegmentedSession() {
                         if (finished.get()) return
+                        muteRecognitionChimeBriefly()
                         if (lastPartial.isNotBlank()) {
                             mergeSegment(lastPartial)
                         }
                         if (combinedQuestion.isNotBlank()) {
                             scheduleFinishAfterRealPause()
-                            // Some recognizers end segmented mode earlier than requested;
-                            // continue with the same instance so speech after a pause is
-                            // still captured.
                             mainHandler.post { startNextSession() }
                         } else {
                             initialNoSpeechCount++
@@ -766,8 +772,10 @@ class BackgroundMicService : Service() {
                         sessionCount++
                         lastPartial = ""
                         try {
+                            muteRecognitionChimeBriefly()
                             speech.startListening(recognitionIntent())
                         } catch (e: Exception) {
+                            restoreRecognitionAudio()
                             fatalFallback.set(true)
                             finishOnce(
                                 combinedQuestion,
@@ -780,6 +788,7 @@ class BackgroundMicService : Service() {
 
                 startNextSession()
             } catch (e: Exception) {
+                restoreRecognitionAudio()
                 fatalFallback.set(true)
                 errorText.set("${e.javaClass.simpleName}: ${e.message ?: "start failed"}")
                 finished.set(true)
@@ -802,7 +811,10 @@ class BackgroundMicService : Service() {
         }
 
         questionLatch = null
-        mainHandler.post { destroyActiveSpeechRecognizerOnMain() }
+        mainHandler.post {
+            restoreRecognitionAudio()
+            destroyActiveSpeechRecognizerOnMain()
+        }
 
         return AndroidSpeechResult(
             text = finalText.get().trim().lowercase(),
@@ -822,8 +834,6 @@ class BackgroundMicService : Service() {
         if (next.startsWith("$old ")) return next
         if (old.endsWith(" $next")) return old
 
-        // Remove a small overlap at a session boundary (for example
-        // "capital of" + "of Australia" -> "capital of Australia").
         val oldWords = old.split(" ")
         val nextWords = next.split(" ")
         val maxOverlap = minOf(5, oldWords.size, nextWords.size)
@@ -948,6 +958,52 @@ class BackgroundMicService : Service() {
         else -> "speech error $error"
     }
 
+    private fun muteRecognitionChimeBriefly() {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        try {
+            mainHandler.removeCallbacks(restoreRecognitionAudioRunnable)
+            if (!recognitionAudioMutedByUs && !audioManager.isStreamMute(AudioManager.STREAM_MUSIC)) {
+                audioManager.adjustStreamVolume(
+                    AudioManager.STREAM_MUSIC,
+                    AudioManager.ADJUST_MUTE,
+                    0
+                )
+                recognitionAudioMutedByUs = true
+            }
+            if (recognitionAudioMutedByUs) {
+                mainHandler.postDelayed(restoreRecognitionAudioRunnable, RECOGNIZER_CHIME_MUTE_MS)
+            }
+        } catch (_: Exception) {
+            recognitionAudioMutedByUs = false
+        }
+    }
+
+    private fun scheduleRecognitionAudioRestore(delayMs: Long) {
+        mainHandler.removeCallbacks(restoreRecognitionAudioRunnable)
+        if (!recognitionAudioMutedByUs) return
+        if (delayMs <= 0L) {
+            restoreRecognitionAudio()
+        } else {
+            mainHandler.postDelayed(restoreRecognitionAudioRunnable, delayMs)
+        }
+    }
+
+    private fun restoreRecognitionAudio() {
+        mainHandler.removeCallbacks(restoreRecognitionAudioRunnable)
+        if (!recognitionAudioMutedByUs) return
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        try {
+            audioManager.adjustStreamVolume(
+                AudioManager.STREAM_MUSIC,
+                AudioManager.ADJUST_UNMUTE,
+                0
+            )
+        } catch (_: Exception) {
+        } finally {
+            recognitionAudioMutedByUs = false
+        }
+    }
+
     private fun destroyActiveSpeechRecognizerOnMain() {
         val speech = activeSpeechRecognizer ?: return
         activeSpeechRecognizer = null
@@ -957,9 +1013,17 @@ class BackgroundMicService : Service() {
 
     private fun playDirectTtsReply() {
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+        if (!ttsReady) {
+            prefs.edit().putString("reply_status", "Waiting for Android voice to become ready…").apply()
+            try {
+                ttsInitLatch.await(TTS_INIT_WAIT_MS, TimeUnit.MILLISECONDS)
+            } catch (_: InterruptedException) {
+            }
+        }
+
         val tts = textToSpeech
         val currentReplyCount = prefs.getInt("reply_count", 0)
-
         if (!ttsReady || tts == null) {
             prefs.edit()
                 .putString("reply_status", "Wake reply unavailable — speech engine not ready")
@@ -1062,7 +1126,10 @@ class BackgroundMicService : Service() {
         replyLatch = null
         questionLatch?.countDown()
         questionLatch = null
-        mainHandler.post { destroyActiveSpeechRecognizerOnMain() }
+        mainHandler.post {
+            restoreRecognitionAudio()
+            destroyActiveSpeechRecognizerOnMain()
+        }
 
         val oldRecorder = recorder
         val oldRecognizer = recognizer
@@ -1089,6 +1156,7 @@ class BackgroundMicService : Service() {
         wanted = false
         generation++
         stopCapture(closeModel = true)
+        mainHandler.post { restoreRecognitionAudio() }
         try { textToSpeech?.stop() } catch (_: Exception) {}
         try { textToSpeech?.shutdown() } catch (_: Exception) {}
         textToSpeech = null
