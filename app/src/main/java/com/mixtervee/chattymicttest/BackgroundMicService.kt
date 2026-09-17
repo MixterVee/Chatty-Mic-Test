@@ -52,13 +52,13 @@ class BackgroundMicService : Service() {
         private const val REPLY_TEXT = "Hi Mike, I'm listening."
         private const val REPLY_UTTERANCE_ID = "chatty_direct_reply"
         private const val TTS_INIT_WAIT_MS = 5000L
-        private const val RECOGNIZER_CHIME_MUTE_MS = 850L
-        private const val RECOGNIZER_CHIME_READY_DELAY_MS = 300L
+        private const val RECOGNIZER_CHIME_MUTE_MS = 45000L
 
-        // v0.13 keeps v0.12's pause-tolerant recognizer, but fixes two rough edges:
-        // wait for Android TTS to finish initializing before the FIRST wake reply, and
-        // briefly mute the TV's media stream only while Android speech recognition is
-        // re-armed so its start/transition chime does not sound like Chatty stopped.
+        // v0.14 keeps v0.13's recognition and first-wake fixes, but holds the TV media
+        // stream muted for the entire Android question-listening phase. v0.13's short
+        // mute window could miss Google TV's end-of-speech chime because the tone can
+        // play before/around the recognition callback. TTS finishes before this guard
+        // begins, and audio is restored when question capture ends.
         private const val QUESTION_MAX_DURATION_MS = 40000L
         private const val QUESTION_END_PAUSE_MS = 3500L
         private const val MAX_ANDROID_SESSIONS = 20
@@ -613,7 +613,6 @@ class BackgroundMicService : Service() {
                 val listener = object : RecognitionListener {
                     override fun onReadyForSpeech(params: Bundle?) {
                         if (!finished.get()) {
-                            scheduleRecognitionAudioRestore(RECOGNIZER_CHIME_READY_DELAY_MS)
                             val status = if (combinedQuestion.isBlank()) {
                                 "LISTENING — ask your question now"
                             } else {
@@ -625,7 +624,6 @@ class BackgroundMicService : Service() {
 
                     override fun onBeginningOfSpeech() {
                         if (!finished.get()) {
-                            scheduleRecognitionAudioRestore(0L)
                             cancelPauseFinish()
                             prefs.edit().putString("question_status", "Hearing you…").apply()
                         }
@@ -714,7 +712,6 @@ class BackgroundMicService : Service() {
                         val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         val partial = matches?.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
                         if (partial.isNotBlank()) {
-                            scheduleRecognitionAudioRestore(0L)
                             cancelPauseFinish()
                             lastPartial = partial
                             val preview = mergeSpeechSegment(combinedQuestion, partial)
@@ -975,16 +972,6 @@ class BackgroundMicService : Service() {
             }
         } catch (_: Exception) {
             recognitionAudioMutedByUs = false
-        }
-    }
-
-    private fun scheduleRecognitionAudioRestore(delayMs: Long) {
-        mainHandler.removeCallbacks(restoreRecognitionAudioRunnable)
-        if (!recognitionAudioMutedByUs) return
-        if (delayMs <= 0L) {
-            restoreRecognitionAudio()
-        } else {
-            mainHandler.postDelayed(restoreRecognitionAudioRunnable, delayMs)
         }
     }
 
