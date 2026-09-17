@@ -1,0 +1,111 @@
+name: Apply Chatty v0.14 patch
+
+on:
+  push:
+    paths:
+      - '.github/workflows/patch-v014.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply v0.14 changes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          service = Path('app/src/main/java/com/mixtervee/chattymicttest/BackgroundMicService.kt')
+          s = service.read_text()
+
+          old = '''        private const val RECOGNIZER_CHIME_MUTE_MS = 850L
+        private const val RECOGNIZER_CHIME_READY_DELAY_MS = 300L
+
+        // v0.13 keeps v0.12's pause-tolerant recognizer, but fixes two rough edges:
+        // wait for Android TTS to finish initializing before the FIRST wake reply, and
+        // briefly mute the TV's media stream only while Android speech recognition is
+        // re-armed so its start/transition chime does not sound like Chatty stopped.'''
+          new = '''        private const val RECOGNIZER_CHIME_MUTE_MS = 45000L
+        private const val RECOGNIZER_CHIME_READY_DELAY_MS = 300L
+
+        // v0.14 keeps v0.13's recognition and first-wake fixes, but holds the TV media
+        // stream muted for the entire Android question-listening phase. v0.13's short
+        // mute window could miss Google TV's end-of-speech chime because the tone can
+        // play before/around the recognition callback. TTS finishes before this guard
+        // begins, and the exact prior mute state is restored when question capture ends.'''
+          if old not in s:
+              raise SystemExit('Expected v0.13 constants/comment block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''                    override fun onReadyForSpeech(params: Bundle?) {
+                        if (!finished.get()) {
+                            scheduleRecognitionAudioRestore(RECOGNIZER_CHIME_READY_DELAY_MS)
+                            val status = if (combinedQuestion.isBlank()) {'''
+          new = '''                    override fun onReadyForSpeech(params: Bundle?) {
+                        if (!finished.get()) {
+                            val status = if (combinedQuestion.isBlank()) {'''
+          if old not in s:
+              raise SystemExit('onReadyForSpeech block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''                    override fun onBeginningOfSpeech() {
+                        if (!finished.get()) {
+                            scheduleRecognitionAudioRestore(0L)
+                            cancelPauseFinish()'''
+          new = '''                    override fun onBeginningOfSpeech() {
+                        if (!finished.get()) {
+                            cancelPauseFinish()'''
+          if old not in s:
+              raise SystemExit('onBeginningOfSpeech block not found')
+          s = s.replace(old, new, 1)
+
+          old = '''                        if (partial.isNotBlank()) {
+                            scheduleRecognitionAudioRestore(0L)
+                            cancelPauseFinish()'''
+          new = '''                        if (partial.isNotBlank()) {
+                            cancelPauseFinish()'''
+          if old not in s:
+              raise SystemExit('onPartialResults block not found')
+          s = s.replace(old, new, 1)
+
+          service.write_text(s)
+
+          activity = Path('app/src/main/java/com/mixtervee/chattymicttest/MainActivity.kt')
+          a = activity.read_text()
+          if 'Chatty Mic Test v0.13' not in a:
+              raise SystemExit('v0.13 title not found')
+          activity.write_text(a.replace('Chatty Mic Test v0.13', 'Chatty Mic Test v0.14', 1))
+
+          gradle = Path('app/build.gradle.kts')
+          g = gradle.read_text()
+          if 'versionCode = 13' not in g or 'versionName = "0.13"' not in g:
+              raise SystemExit('v0.13 Gradle version not found')
+          g = g.replace('versionCode = 13', 'versionCode = 14', 1)
+          g = g.replace('versionName = "0.13"', 'versionName = "0.14"', 1)
+          gradle.write_text(g)
+
+          workflow = Path('.github/workflows/build.yml')
+          w = workflow.read_text()
+          if 'Chatty-Mic-Test-v0.13' not in w:
+              raise SystemExit('v0.13 artifact name not found')
+          workflow.write_text(w.replace('Chatty-Mic-Test-v0.13', 'Chatty-Mic-Test-v0.14', 1))
+          PY
+
+      - name: Commit v0.14
+        run: |
+          git config user.name "MixterVee"
+          git config user.email "mixtervandal@gmail.com"
+          git add app/src/main/java/com/mixtervee/chattymicttest/BackgroundMicService.kt \
+                  app/src/main/java/com/mixtervee/chattymicttest/MainActivity.kt \
+                  app/build.gradle.kts \
+                  .github/workflows/build.yml
+          git commit -m "Build Chatty Mic Test v0.14"
+          git push origin main
